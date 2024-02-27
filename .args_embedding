@@ -1,0 +1,15 @@
+-m
+nomic-embed-text-v1.5.Q4_K_M.gguf
+--host
+0.0.0.0
+--port
+8020
+-c
+8192
+--embedding
+--nobrowser
+--server
+-ngl
+9999
+...
+

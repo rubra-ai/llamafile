@@ -9,3 +9,6 @@
 /perf.data.old
 
 /*.log
+*.DS_Store
+*.llamafile
+*.gguf

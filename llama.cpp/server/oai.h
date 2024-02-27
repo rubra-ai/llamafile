@@ -16,6 +16,57 @@
 #define DEFAULT_OAICOMPAT_MODEL "gpt-3.5-turbo-0613"
 
 using json = nlohmann::json;
+const char* myGrammar = R"(
+root ::= Function
+Function ::= Chat | FileKnowledge | GoogleSearch
+Chat ::= "{"   ws   "\"choice\":"   ws   "\"Chat\","   ws   "\"content\":"   ws   string   "}"
+FileKnowledge ::= "{"   ws   "\"function\":"   ws   "\"FileKnowledge\","   ws   "\"args\":"   ws   object   "}"
+GoogleSearch ::= "{"   ws   "\"function\":"   ws   "\"GoogleSearchTool\","   ws   "\"args\":"   ws   object   "}"
+
+value  ::= object | array | string | number | ("true" | "false" | "null") ws
+
+object ::=
+  "{" ws (
+            string ":" ws value
+    ("," ws string ":" ws value)*
+  )? "}" ws
+
+array  ::=
+  "[" ws (
+            value
+    ("," ws value)*
+  )? "]" ws
+
+string ::=
+  "\"" (
+    [^"\\] |
+    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes
+  )* "\"" ws
+
+number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
+
+# Optional space: by convention, applied in this grammar after literal chars when allowed
+ws ::= ([ ] ws)?
+)";
+
+
+const char* webGrammar = R"(
+root ::= True | False
+True::= string
+False ::= "Not enough information"
+
+string ::=
+  (
+    [^"\\] |
+    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes
+  )* ws
+
+# Optional space: by convention, applied in this grammar after literal chars when allowed
+ws ::= ([ ] ws)?
+)";
+
+
+
 
 inline static json oaicompat_completion_params_parse(
     const struct llama_model * model,
@@ -55,10 +106,30 @@ inline static json oaicompat_completion_params_parse(
     llama_params["ignore_eos"]        = json_value(body, "ignore_eos", false);
     llama_params["tfs_z"]             = json_value(body, "tfs_z", default_sparams.tfs_z);
 
-    if (body.count("grammar") != 0) {
-        llama_params["grammar"] = json_value(body, "grammar", json::object());
-    }
+    // if (body.count("grammar") != 0) {
+    //     llama_params["grammar"] = json_value(body, "grammar", json::object());
+    // }
 
+
+    if (body.count("response_format") != 0) { 
+        std::cout << "Using Grammar!" << std::endl;
+        if (body["response_format"].is_string()) {
+            std::cout << "Using Custom Grammar:" << std::endl;
+            if (body["response_format"] == "web") {
+                llama_params["grammar"] = webGrammar;
+                std::cout << webGrammar << std::endl;
+            } else {
+                llama_params["grammar"] = body["response_format"];
+                std::cout << body["response_format"] << std::endl;
+            }
+            
+        } else {// TODO: need to verify if the value is {"type": "json_object"}
+            llama_params["grammar"] = myGrammar;
+        }
+    } else {
+        std::cout << "Not Using Grammar!" << std::endl;
+    }
+    
     // Handle 'stop' field
     if (body.contains("stop") && body["stop"].is_string()) {
         llama_params["stop"] = json::array({body["stop"].get<std::string>()});
