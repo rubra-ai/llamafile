@@ -1,5 +1,5 @@
 // -*- mode:c++;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
-// vi: set et ft=c++ ts=4 sts=4 sw=4 fenc=utf-8 :vi
+// vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
 
 #pragma once
 
@@ -10,7 +10,7 @@
 #include <condition_variable>
 #include <unordered_map>
 
-#include "json.h"
+#include "llama.cpp/json.h"
 #include "utils.h"
 
 #define DEFAULT_OAICOMPAT_MODEL "gpt-3.5-turbo-0613"

@@ -2,7 +2,7 @@
 #── vi: set noet ft=make ts=8 sw=8 fenc=utf-8 :vi ────────────────────┘
 
 PREFIX = /usr/local
-COSMOCC = .cosmocc/3.3.2
+COSMOCC = .cosmocc/3.3.10
 TOOLCHAIN = $(COSMOCC)/bin/cosmo
 
 AR = $(TOOLCHAIN)ar
@@ -13,12 +13,13 @@ MKDEPS = $(COSMOCC)/bin/mkdeps
 INSTALL = install
 
 ARFLAGS = rcsD
-CCFLAGS = -g -O3 -fexceptions
-CPPFLAGS_ = -iquote. -mcosmo -DGGML_MULTIPLATFORM -Wno-attributes
-TARGET_ARCH = -Xx86_64-mavx -Xx86_64-mtune=alderlake
+CCFLAGS = -g -O3 -fexceptions -fsignaling-nans
+CPPFLAGS_ = -iquote. -mcosmo -DGGML_MULTIPLATFORM -Wno-attributes -DLLAMAFILE_DEBUG
+TARGET_ARCH = -Xx86_64-mavx -Xx86_64-mtune=znver4
 
 TMPDIR = o//tmp
 IGNORE := $(shell mkdir -p $(TMPDIR))
+ARCH := $(shell uname -m)
 
 # apple still distributes a 17 year old version of gnu make
 ifeq ($(MAKE_VERSION), 3.81)
@@ -50,5 +51,5 @@ clean:; rm -rf o
 .PHONY: distclean
 distclean:; rm -rf o .cosmocc
 
-.cosmocc/3.3.2:
-	build/download-cosmocc.sh $@ 3.3.2 a695012ffbeac5e26e3c4a740debc15273f47e9a8bdc55e8b76a623154d5914b
+.cosmocc/3.3.10:
+	build/download-cosmocc.sh $@ 3.3.10 00d61c1215667314f66e288c8285bae38cc6137fca083e5bba6c74e3a52439de

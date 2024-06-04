@@ -88,27 +88,46 @@ extern "C" {
         // (optional) asynchronous tensor data access
         void (*GGML_CALL set_tensor_async)(ggml_backend_t backend,       struct ggml_tensor * tensor, const void * data, size_t offset, size_t size);
         void (*GGML_CALL get_tensor_async)(ggml_backend_t backend, const struct ggml_tensor * tensor,       void * data, size_t offset, size_t size);
-        bool (*GGML_CALL cpy_tensor_async)(ggml_backend_t backend, const struct ggml_tensor * src, struct ggml_tensor * dst);
+        bool (*GGML_CALL cpy_tensor_async)(ggml_backend_t backend_src, ggml_backend_t backend_dst, const struct ggml_tensor * src, struct ggml_tensor * dst);
 
         // (optional) complete all pending operations
         void (*GGML_CALL synchronize)(ggml_backend_t backend);
 
-        // compute graph with a plan
+        // compute graph with a plan (not used currently)
         ggml_backend_graph_plan_t (*GGML_CALL graph_plan_create) (ggml_backend_t backend, const struct ggml_cgraph * cgraph);
         void                      (*GGML_CALL graph_plan_free)   (ggml_backend_t backend, ggml_backend_graph_plan_t plan);
-        void                      (*GGML_CALL graph_plan_compute)(ggml_backend_t backend, ggml_backend_graph_plan_t plan);
 
+        // compute graph with a plan
+        enum ggml_status (*GGML_CALL graph_plan_compute)(ggml_backend_t backend, ggml_backend_graph_plan_t plan);
         // compute graph without a plan (async)
-        bool (*GGML_CALL graph_compute)(ggml_backend_t backend, struct ggml_cgraph * cgraph);
+        enum ggml_status (*GGML_CALL graph_compute)     (ggml_backend_t backend, struct ggml_cgraph * cgraph);
 
         // check if the backend supports an operation
         bool (*GGML_CALL supports_op)(ggml_backend_t backend, const struct ggml_tensor * op);
+
+        // check if the backend wants to run an operation, even if the weights are allocated in a CPU buffer
+        // these should be expensive operations with large batch sizes that may benefit from running on this backend
+        // even if the weight has to be copied from the CPU temporarily
+        bool (*GGML_CALL offload_op)(ggml_backend_t backend, const struct ggml_tensor * op);
+
+        // (optional) event synchronization
+        ggml_backend_event_t (*GGML_CALL event_new)         (ggml_backend_t backend);
+        void                 (*GGML_CALL event_free)        (ggml_backend_event_t event);
+        void                 (*GGML_CALL event_record)      (ggml_backend_event_t event);
+        void                 (*GGML_CALL event_wait)        (ggml_backend_t backend, ggml_backend_event_t event);
+        void                 (*GGML_CALL event_synchronize) (ggml_backend_event_t event);
     };
 
     struct ggml_backend {
-        struct ggml_backend_i iface;
+        ggml_guid_t guid;
 
+        struct ggml_backend_i iface;
         ggml_backend_context_t context;
+    };
+
+    struct ggml_backend_event {
+        ggml_backend_t backend;
+        void * context;
     };
 
     //
@@ -131,6 +150,8 @@ extern "C" {
         void (*GGML_CALL exit)(int);
         void (*GGML_CALL free)(void *);
         void *(*GGML_CALL malloc)(size_t);
+        char *(*GGML_CALL getenv)(const char *);
+        long (*GGML_CALL write)(int, const void *, long);
         void (*GGML_CALL ggml_backend_register)(const char *, ggml_backend_init_fn, ggml_backend_buffer_type_t, void *);
         ggml_backend_buffer_t (*GGML_CALL ggml_backend_buffer_init)(ggml_backend_buffer_type_t, struct ggml_backend_buffer_i, ggml_backend_buffer_context_t, size_t);
         ggml_backend_buffer_t (*GGML_CALL ggml_backend_cpu_buffer_from_ptr)(void *, size_t);
@@ -157,6 +178,9 @@ extern "C" {
         void (*GGML_CALL ggml_rope_yarn_corr_dims)(int, int, float, float, float, float[2]);
         const char *(*GGML_CALL ggml_op_desc)(const struct ggml_tensor *);
         bool (*GGML_CALL ggml_backend_buffer_is_host)(ggml_backend_buffer_t);
+        bool (*GGML_CALL ggml_guid_matches)(ggml_guid_t, ggml_guid_t);
+        bool (*GGML_CALL ggml_is_empty)(const struct ggml_tensor *);
+        bool (*GGML_CALL ggml_are_same_shape)(const struct ggml_tensor *, const struct ggml_tensor *);
     };
 
 #ifdef  __cplusplus

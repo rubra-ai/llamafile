@@ -10,11 +10,17 @@ LLAMA_CPP_MAIN_OBJS = $(LLAMA_CPP_MAIN_SRCS:%.cpp=o/$(MODE)/%.o)
 
 o/$(MODE)/llama.cpp/main/main:					\
 		o/$(MODE)/llama.cpp/main/main.o			\
+		o/$(MODE)/llama.cpp/main/embedding.o		\
 		o/$(MODE)/llama.cpp/server/server.a		\
 		o/$(MODE)/llama.cpp/llava/llava.a		\
 		o/$(MODE)/llama.cpp/llama.cpp.a			\
 		o/$(MODE)/llama.cpp/main/main.1.asc.zip.o	\
 		$(LLAMA_CPP_SERVER_ASSETS:%=o/$(MODE)/%.zip.o)
+
+o/$(MODE)/llama.cpp/main/main.o: private			\
+		CCFLAGS += -Os
+
+$(LLAMA_CPP_MAIN_OBJS): llama.cpp/main/BUILD.mk
 
 .PHONY: o/$(MODE)/llama.cpp/main
 o/$(MODE)/llama.cpp/main:					\

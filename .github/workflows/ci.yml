@@ -1,45 +1,63 @@
 name: CI
 on:
   push:
-    branches: [ master, main ]
+    branches: [ master, main, fix ]
   pull_request:
-    branches: [ master, main ]
+    branches: [ master, main, fix ]
+
 jobs:
-  Tests:
+  ubuntu-focal-make:
     timeout-minutes: 60
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [  macos-latest ] # ubuntu-latest, windows-latest are currently non-functional, requiring adaptation for proper functionality. 
+    runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
+      - name: Clone
+        id: checkout
         uses: actions/checkout@v4
-      - name: Build and Install CosmoCC
-        shell: bash
+
+      - name: Dependencies
+        id: depends
         run: |
-          mkdir -p cosmocc
-          cd cosmocc
-          curl -o cosmocc.zip -L  https://cosmo.zip/pub/cosmocc/cosmocc.zip
-          unzip cosmocc.zip
-          cd ..
-          ./cosmocc/bin/make -j8 && ./cosmocc/bin/make install
-      - name: Create LLM Executable
-        shell: bash 
+          sudo apt-get update
+          sudo apt-get install make
+
+      - name: Cache cosmocc toolchain
+        id: cache-cosmocc-toolchain
+        uses: actions/cache@v4
+        env:
+          cache-name: cache-cosmocc-toolchain
+        with:
+          path: |
+            .cosmocc
+            o/depend
+            o/depend.test
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/config.mk') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}
+
+      - name: Setup cosmocc and ape loader
         run: |
-          curl -o mistral.gguf -L https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_K_M.gguf
+          sudo make cosmocc-ci PREFIX=/usr
+
+      - name: Build
+        run: |
+          sudo make -j $(nproc)
+
+      - name: Make Llamafile
+        run: |
+          cp ./models/TinyLLama-v0.1-5M-F16.gguf tinyllama.gguf
           cat << EoF > .args
           -m
-          mistral.gguf
+          tinyllama.gguf
           ...
           EoF
-          cp /usr/local/bin/llamafile llamafile_exe
-          chmod +x llamafile_exe
-          zipalign -j0 \
-            llamafile_exe \
-            mistral.gguf \
+          cp o//llama.cpp/main/main \
+            tinyllama.llamafile
+          o//llamafile/zipalign -j0 \
+            tinyllama.llamafile \
+            tinyllama.gguf \
             .args
-      - name: Execute LLM CLI
-        shell: bash
+
+      - name: Execute LLM CLI CPU  # GA doesn't have "support_simdgroup_reduction" for RMS_NORM :'(
         run: |
-          ./llamafile_exe --temp 0.7 --n-predict 50 -p '[INST]Write a story about llamas[/INST]'
+          ./tinyllama.llamafile -e -p '## Famous Speech\n\nFour score and seven' -n 50 -ngl 0

@@ -7,6 +7,7 @@ scp llama.cpp/ggml-cuda.cu \
     llama.cpp/ggml-cuda.h \
     llama.cpp/ggml-impl.h \
     llama.cpp/ggml-alloc.h \
+    llama.cpp/ggml-common.h \
     llama.cpp/ggml-backend.h \
     llama.cpp/ggml-backend-impl.h \
     llama.cpp/ggml.h \
@@ -14,6 +15,7 @@ scp llama.cpp/ggml-cuda.cu \
     llamafile/tinyblas.cu \
     llamafile/llamafile.h \
     llamafile/rocm.bat \
+    llamafile/rocm.sh \
     llamafile/cuda.bat \
     llamafile/cuda.sh \
     $HOST:lfbuild/

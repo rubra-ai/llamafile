@@ -1,5 +1,5 @@
 // -*- mode:c++;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
-// vi: set et ft=c++ ts=4 sts=4 sw=4 fenc=utf-8 :vi
+// vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
 
 #pragma once
 
@@ -10,8 +10,7 @@
 #include <condition_variable>
 #include <unordered_map>
 
-#include "json.h"
-
+#include "llama.cpp/json.h"
 #include "llama.cpp/llava/clip.h"
 
 using json = nlohmann::json;
@@ -268,7 +267,7 @@ struct llama_server_queue {
     }
 
     // Add a new task, but defer until one slot is available
-    void defer(task_server task) {
+    void defer_(task_server task) {
         std::unique_lock<std::mutex> lock(mutex_tasks);
         queue_tasks_deferred.push_back(std::move(task));
     }

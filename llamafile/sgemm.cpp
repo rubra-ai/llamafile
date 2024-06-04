@@ -1,5 +1,5 @@
 // -*- mode:c++;indent-tabs-mode:nil;c-basic-offset:4;coding:utf-8 -*-
-// vi: set et ft=c++ ts=4 sts=4 sw=4 fenc=utf-8 :vi
+// vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
 //
 // Copyright 2024 Mozilla Foundation
 //
@@ -15,498 +15,135 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "llama.cpp/ggml-quants.h"
+#include "sgemm.h"
 #include "llamafile.h"
+#include <cassert>
 #include <cosmo.h>
-#include <immintrin.h>
-#include <stdio.h>
+#include <cpuid.h>
+#include <libc/sysv/consts/hwcap.h>
+#include <sys/auxv.h>
 
-//
-//                     _   _          ___ _      _   ___
-//                    | |_(_)_ _ _  _| _ ) |    /_\ / __|
-//                    |  _| | ' \ || | _ \ |__ / _ \\__ \.
-//                     \__|_|_||_\_, |___/____/_/ \_\___/
-//                               |__/
-//
-//                      BASIC LINEAR ALGEBRA SUBPROGRAMS
-//
-
-#define ASSERT(x)                                                              \
-    if (!(x)) {                                                                \
-        fprintf(stderr, "%s:%d: assertion failed: %s\n", __FILE__, __LINE__,   \
-                #x);                                                           \
-        __builtin_trap();                                                      \
-    }
-
-#define END_KERNEL() }
-#define BEGIN_KERNEL(RM, RN)                                                   \
-    long ytiles = (m - m0) / RM;                                               \
-    long xtiles = (n - n0) / RN;                                               \
-    long tiles = ytiles * xtiles;                                              \
-    double duty = (double)tiles / nth;                                         \
-    if (duty < 1)                                                              \
-        duty = 1;                                                              \
-    double spot = duty * ith + .5;                                             \
-    long end = spot + duty;                                                    \
-    long start = spot;                                                         \
-    if (end > tiles)                                                           \
-        end = tiles;                                                           \
-    for (long job = start; job < end; ++job) {                                 \
-        long i = m0 + job / xtiles * RM;                                       \
-        long j = n0 + job % xtiles * RN;
-
+static const struct GemmFuncs {
+    typeof(llamafile_sgemm) *sgemm;
+    typeof(llamafile_mixmul) *mixmul;
+    typeof(llamafile_mixmul_iqk) *iqk_mixmul = iqk_mul_mat_moe_unsupported;
+    GemmFuncs() {
 #ifdef __x86_64__
-#pragma GCC push_options
-#pragma GCC target("avx2,fma,f16c,avxvnni")
-
-#define MM256_SET_M128I(a, b)                                                  \
-    _mm256_insertf128_si256(_mm256_castsi128_si256(b), (a), 1)
-
-static inline float unhalf(ggml_fp16_t d) {
-    return GGML_FP16_TO_FP32(d);
-}
-
-static dontinline float hsum8f(__m256 x) {
-    __m128 res = _mm256_extractf128_ps(x, 1);
-    res = _mm_add_ps(res, _mm256_castps256_ps128(x));
-    res = _mm_add_ps(res, _mm_movehl_ps(res, res));
-    res = _mm_add_ss(res, _mm_movehdup_ps(res));
-    return _mm_cvtss_f32(res);
-}
-
-static inline __m256i denibble32(const uint8_t *p) {
-    const __m128i tmp = _mm_loadu_si128((const __m128i *)p);
-    const __m256i bytes = MM256_SET_M128I(_mm_srli_epi16(tmp, 4), tmp);
-    const __m256i lowMask = _mm256_set1_epi8(15);
-    return _mm256_and_si256(lowMask, bytes);
-}
-
-template <typename T> static inline __m256 load8f(const T *);
-template <> inline __m256 load8f(const float *p) {
-    return _mm256_loadu_ps(p);
-}
-template <> inline __m256 load8f(const ggml_fp16_t *p) {
-    return _mm256_cvtph_ps(_mm_loadu_si128((const __m128i *)p));
-}
-
-template <typename T> static inline __m256i load32i(const T *);
-template <> inline __m256i load32i(const block_q8_0 *b) {
-    return _mm256_loadu_si256((const __m256i *)b->qs);
-}
-template <> inline __m256i load32i(const block_q4_0 *b) {
-    return _mm256_sub_epi8(denibble32(b->qs), _mm256_set1_epi8(8));
-}
-
-template <typename T> class tinyBLAS {
-  public:
-    tinyBLAS(long k, const T *A, long lda, const T *B, long ldb, float *C,
-             long ldc, long ith, long nth)
-        : k(k), A(A), lda(lda), B(B), ldb(ldb), C(C), ldc(ldc), ith(ith),
-          nth(nth) {
-        ASSERT(A != nullptr);
-        ASSERT(B != nullptr);
-        ASSERT(C != nullptr);
-        ASSERT(k >= 0 && k % 8 == 0);
-        ASSERT(ith >= 0 && ith < nth);
-    }
-
-    void gemm(long m, long n) {
-        ASSERT(m >= 0);
-        ASSERT(n >= 0);
-        ASSERT(ldc >= m);
-        mnpack(0, m, 0, n);
-    }
-
-  private:
-    void mnpack(long m0, long m, long n0, long n) {
-        if (m - m0 <= 0 || n - n0 <= 0)
-            return;
-        long mc, nc, mp, np;
-        if (m - m0 >= 3 && n - n0 >= 4) {
-            mc = 3;
-            nc = 4;
-            gemm3x4(m0, m, n0, n);
-        } else if (m - m0 >= 4 && n - n0 >= 1) {
-            mc = 4;
-            nc = 1;
-            gemm4x1(m0, m, n0, n);
-        } else if (m - m0 >= 1 && n - n0 >= 4) {
-            mc = 1;
-            nc = 4;
-            gemm1x4(m0, m, n0, n);
+        if (X86_HAVE(AVX)) {
+            if (X86_HAVE(FMA)) {
+                if (X86_HAVE(AVX2)) {
+                    if (X86_HAVE(AVX512F)) {
+                        if (X86_HAVE(AVX512VL) && //
+                            X86_HAVE(AVX512BW) && //
+                            X86_HAVE(AVX512DQ) && //
+                            X86_HAVE(AVX512_VNNI) && //
+                            X86_HAVE(AVX512_BF16)) {
+                            // AMD Zen4+ (2023-)
+                            sgemm = llamafile_sgemm_amd_zen4;
+                            mixmul = llamafile_mixmul_amd_zen4;
+                            iqk_mixmul = iqk_mul_mat_moe_zen4;
+                        } else {
+                            // Intel Xeon Skylake+ (2015-)
+                            sgemm = llamafile_sgemm_amd_avx512f;
+                            mixmul = llamafile_mixmul_amd_avx512f;
+                            iqk_mixmul = iqk_mul_mat_moe;
+                        }
+                    } else if (X86_HAVE(AVXVNNI)) {
+                        // Intel Alderlake (2021-)
+                        sgemm = llamafile_sgemm_amd_avxvnni;
+                        mixmul = llamafile_mixmul_amd_avxvnni;
+                        iqk_mixmul = iqk_mul_mat_moe;
+                    } else {
+                        // Intel Haswell/Broadwell/Skylake (2013-2020)
+                        // AMD Excavator (2015-2022)
+                        sgemm = llamafile_sgemm_amd_avx2;
+                        mixmul = llamafile_mixmul_amd_avx2;
+                        if (X86_HAVE(F16C))
+                            iqk_mixmul = iqk_mul_mat_moe;
+                    }
+                } else {
+                    // AMD Piledriver (2011-2014)
+                    sgemm = llamafile_sgemm_amd_fma;
+                    mixmul = llamafile_mixmul_amd_fma;
+                    if (X86_HAVE(F16C))
+                        iqk_mixmul = iqk_mul_mat_moe;
+                }
+            } else {
+                // Intel Sandybridge/Ivybridge (2010-2012)
+                // AMD Bulldozer (2011)
+                sgemm = llamafile_sgemm_amd_avx;
+                mixmul = llamafile_mixmul_amd_avx;
+            }
         } else {
-            mc = 1;
-            nc = 1;
-            gemm1x1(m0, m, n0, n);
+            // AMD K8/Barcelona (2003-2010)
+            // Intel Core/Nehalem (2006-2009)
+            sgemm = llamafile_sgemm_unsupported;
+            mixmul = llamafile_mixmul_unsupported;
         }
-        mp = m0 + (m - m0) / mc * mc;
-        np = n0 + (n - n0) / nc * nc;
-        mnpack(mp, m, n0, np);
-        mnpack(m0, mp, np, n);
-        mnpack(mp, m, np, n);
-    }
-
-    dontinline void gemm3x4(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(3, 4)
-        __m256 c00 = _mm256_setzero_ps();
-        __m256 c01 = _mm256_setzero_ps();
-        __m256 c02 = _mm256_setzero_ps();
-        __m256 c03 = _mm256_setzero_ps();
-        __m256 c10 = _mm256_setzero_ps();
-        __m256 c11 = _mm256_setzero_ps();
-        __m256 c12 = _mm256_setzero_ps();
-        __m256 c13 = _mm256_setzero_ps();
-        __m256 c20 = _mm256_setzero_ps();
-        __m256 c21 = _mm256_setzero_ps();
-        __m256 c22 = _mm256_setzero_ps();
-        __m256 c23 = _mm256_setzero_ps();
-        for (long l = 0; l < k; l += 8) {
-            __m256 k0 = load8f(B + ldb * (j + 0) + l);
-            __m256 k1 = load8f(B + ldb * (j + 1) + l);
-            __m256 k2 = load8f(B + ldb * (j + 2) + l);
-            __m256 k3 = load8f(B + ldb * (j + 3) + l);
-            __m256 a0 = load8f(A + lda * (i + 0) + l);
-            c00 = _mm256_fmadd_ps(a0, k0, c00);
-            c01 = _mm256_fmadd_ps(a0, k1, c01);
-            c02 = _mm256_fmadd_ps(a0, k2, c02);
-            c03 = _mm256_fmadd_ps(a0, k3, c03);
-            __m256 a1 = load8f(A + lda * (i + 1) + l);
-            c10 = _mm256_fmadd_ps(a1, k0, c10);
-            c11 = _mm256_fmadd_ps(a1, k1, c11);
-            c12 = _mm256_fmadd_ps(a1, k2, c12);
-            c13 = _mm256_fmadd_ps(a1, k3, c13);
-            __m256 a2 = load8f(A + lda * (i + 2) + l);
-            c20 = _mm256_fmadd_ps(a2, k0, c20);
-            c21 = _mm256_fmadd_ps(a2, k1, c21);
-            c22 = _mm256_fmadd_ps(a2, k2, c22);
-            c23 = _mm256_fmadd_ps(a2, k3, c23);
-        }
-        C[ldc * (j + 0) + (i + 0)] = hsum8f(c00);
-        C[ldc * (j + 0) + (i + 1)] = hsum8f(c10);
-        C[ldc * (j + 0) + (i + 2)] = hsum8f(c20);
-        C[ldc * (j + 1) + (i + 0)] = hsum8f(c01);
-        C[ldc * (j + 1) + (i + 1)] = hsum8f(c11);
-        C[ldc * (j + 1) + (i + 2)] = hsum8f(c21);
-        C[ldc * (j + 2) + (i + 0)] = hsum8f(c02);
-        C[ldc * (j + 2) + (i + 1)] = hsum8f(c12);
-        C[ldc * (j + 2) + (i + 2)] = hsum8f(c22);
-        C[ldc * (j + 3) + (i + 0)] = hsum8f(c03);
-        C[ldc * (j + 3) + (i + 1)] = hsum8f(c13);
-        C[ldc * (j + 3) + (i + 2)] = hsum8f(c23);
-        END_KERNEL()
-    }
-
-    dontinline void gemm1x4(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(1, 4)
-        __m256 c00 = _mm256_setzero_ps();
-        __m256 c01 = _mm256_setzero_ps();
-        __m256 c02 = _mm256_setzero_ps();
-        __m256 c03 = _mm256_setzero_ps();
-        for (long l = 0; l < k; l += 8) {
-            __m256 a0 = load8f(A + lda * (i + 0) + l);
-            __m256 k0 = load8f(B + ldb * (j + 0) + l);
-            __m256 k1 = load8f(B + ldb * (j + 1) + l);
-            __m256 k2 = load8f(B + ldb * (j + 2) + l);
-            __m256 k3 = load8f(B + ldb * (j + 3) + l);
-            c00 = _mm256_fmadd_ps(a0, k0, c00);
-            c01 = _mm256_fmadd_ps(a0, k1, c01);
-            c02 = _mm256_fmadd_ps(a0, k2, c02);
-            c03 = _mm256_fmadd_ps(a0, k3, c03);
-        }
-        C[ldc * (j + 0) + (i + 0)] = hsum8f(c00);
-        C[ldc * (j + 1) + (i + 0)] = hsum8f(c01);
-        C[ldc * (j + 2) + (i + 0)] = hsum8f(c02);
-        C[ldc * (j + 3) + (i + 0)] = hsum8f(c03);
-        END_KERNEL()
-    }
-
-    dontinline void gemm4x1(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(4, 1)
-        __m256 c00 = _mm256_setzero_ps();
-        __m256 c10 = _mm256_setzero_ps();
-        __m256 c20 = _mm256_setzero_ps();
-        __m256 c30 = _mm256_setzero_ps();
-        for (long l = 0; l < k; l += 8) {
-            __m256 k0 = load8f(B + ldb * (j + 0) + l);
-            __m256 a0 = load8f(A + lda * (i + 0) + l);
-            c00 = _mm256_fmadd_ps(a0, k0, c00);
-            __m256 a1 = load8f(A + lda * (i + 1) + l);
-            c10 = _mm256_fmadd_ps(a1, k0, c10);
-            __m256 a2 = load8f(A + lda * (i + 2) + l);
-            c20 = _mm256_fmadd_ps(a2, k0, c20);
-            __m256 a3 = load8f(A + lda * (i + 3) + l);
-            c30 = _mm256_fmadd_ps(a3, k0, c30);
-        }
-        C[ldc * (j + 0) + (i + 0)] = hsum8f(c00);
-        C[ldc * (j + 0) + (i + 1)] = hsum8f(c10);
-        C[ldc * (j + 0) + (i + 2)] = hsum8f(c20);
-        C[ldc * (j + 0) + (i + 3)] = hsum8f(c30);
-        END_KERNEL()
-    }
-
-    dontinline void gemm1x1(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(1, 1)
-        __m256 c = _mm256_setzero_ps();
-        for (long l = 0; l < k; l += 8) {
-            c = _mm256_fmadd_ps(load8f(A + lda * i + l),
-                                load8f(B + ldb * j + l), c);
-        }
-        C[ldc * j + i] = hsum8f(c);
-        END_KERNEL()
-    }
-
-    const long k;
-    const T *const A;
-    const long lda;
-    const T *const B;
-    const long ldb;
-    float *const C;
-    const long ldc;
-    const long ith;
-    const long nth;
-};
-
-template <typename T, typename U, int avxvnni> class tinyBLASq {
-  public:
-    tinyBLASq(long k, const T *A, long lda, const U *B, long ldb, float *C,
-              long ldc, long ith, long nth)
-        : k(k), A(A), lda(lda), B(B), ldb(ldb), C(C), ldc(ldc), ith(ith),
-          nth(nth) {
-        ASSERT(A != nullptr);
-        ASSERT(B != nullptr);
-        ASSERT(C != nullptr);
-        ASSERT(k >= 0 && k % 32 == 0);
-        ASSERT(ith >= 0 && ith < nth);
-    }
-
-    void gemm(long m, long n) {
-        ASSERT(m >= 0);
-        ASSERT(n >= 0);
-        ASSERT(ldc >= m);
-        mnpack(0, m, 0, n);
-    }
-
-  private:
-    void mnpack(long m0, long m, long n0, long n) {
-        if (m - m0 <= 0 || n - n0 <= 0)
-            return;
-        long mc, nc, mp, np;
-        if (m - m0 >= 1 && n - n0 >= 4) {
-            mc = 1;
-            nc = 4;
-            gemm1x4(m0, m, n0, n);
-        } else if (m - m0 >= 4 && n - n0 >= 1) {
-            mc = 4;
-            nc = 1;
-            gemm4x1(m0, m, n0, n);
+#elif defined(__aarch64__)
+        long hwcap = getauxval(AT_HWCAP);
+        if ((hwcap & HWCAP_FPHP) && // fp16 scalar isa (ID_AA64PFR0_EL1.FP == 1)
+            (hwcap & HWCAP_ASIMDHP) && // fp16 vector isa (ID_AA64PFR0_EL1.AdvSIMD == 1)
+            (hwcap & HWCAP_ASIMDDP)) { // dotprod isa (ID_AA64ISAR0_EL1.DP == 1)
+            // e.g. Apple M1, Raspberry Pi 5
+            sgemm = llamafile_sgemm_arm82;
+            mixmul = llamafile_mixmul_arm82;
+            iqk_mixmul = iqk_mul_mat_moe_arm82;
         } else {
-            mc = 1;
-            nc = 1;
-            gemm1x1(m0, m, n0, n);
+            // ARM64 baseline ISA
+            sgemm = llamafile_sgemm_arm80;
+            mixmul = llamafile_mixmul_arm80;
         }
-        mp = m0 + (m - m0) / mc * mc;
-        np = n0 + (n - n0) / nc * nc;
-        mnpack(mp, m, n0, np);
-        mnpack(m0, mp, np, n);
-        mnpack(mp, m, np, n);
-    }
-
-    dontinline void gemm4x1(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(4, 1)
-        long k2 = k / 32;
-        __m256 c0 = _mm256_setzero_ps();
-        __m256 c1 = _mm256_setzero_ps();
-        __m256 c2 = _mm256_setzero_ps();
-        __m256 c3 = _mm256_setzero_ps();
-        const T *Ap0 = A + lda * (i + 0);
-        const T *Ap1 = A + lda * (i + 1);
-        const T *Ap2 = A + lda * (i + 2);
-        const T *Ap3 = A + lda * (i + 3);
-        const U *Bp = B + ldb * j;
-        for (long l = 0; l < k2; ++l) {
-            float db0 = unhalf(Bp[l].d);
-            __m256i f = load32i(Bp + l);
-            __m256i u = _mm256_sign_epi8(f, f);
-            __m256 d0 = _mm256_set1_ps(unhalf(Ap0[l].d) * db0);
-            __m256 d1 = _mm256_set1_ps(unhalf(Ap1[l].d) * db0);
-            __m256 d2 = _mm256_set1_ps(unhalf(Ap2[l].d) * db0);
-            __m256 d3 = _mm256_set1_ps(unhalf(Ap3[l].d) * db0);
-            __m256i e0 = load32i(Ap0 + l);
-            __m256i e1 = load32i(Ap1 + l);
-            __m256i e2 = load32i(Ap2 + l);
-            __m256i e3 = load32i(Ap3 + l);
-            __m256i s0 = _mm256_sign_epi8(e0, f);
-            __m256i s1 = _mm256_sign_epi8(e1, f);
-            __m256i s2 = _mm256_sign_epi8(e2, f);
-            __m256i s3 = _mm256_sign_epi8(e3, f);
-            __m256 g0 = dotsome(u, s0);
-            __m256 g1 = dotsome(u, s1);
-            __m256 g2 = dotsome(u, s2);
-            __m256 g3 = dotsome(u, s3);
-            c0 = _mm256_fmadd_ps(d0, g0, c0);
-            c1 = _mm256_fmadd_ps(d1, g1, c1);
-            c2 = _mm256_fmadd_ps(d2, g2, c2);
-            c3 = _mm256_fmadd_ps(d3, g3, c3);
-        }
-        C[ldc * j + (i + 0)] = hsum8f(c0);
-        C[ldc * j + (i + 1)] = hsum8f(c1);
-        C[ldc * j + (i + 2)] = hsum8f(c2);
-        C[ldc * j + (i + 3)] = hsum8f(c3);
-        END_KERNEL()
-    }
-
-    dontinline void gemm1x4(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(1, 4)
-        long k2 = k / 32;
-        __m256 c0 = _mm256_setzero_ps();
-        __m256 c1 = _mm256_setzero_ps();
-        __m256 c2 = _mm256_setzero_ps();
-        __m256 c3 = _mm256_setzero_ps();
-        const U *Bp0 = B + ldb * (j + 0);
-        const U *Bp1 = B + ldb * (j + 1);
-        const U *Bp2 = B + ldb * (j + 2);
-        const U *Bp3 = B + ldb * (j + 3);
-        const T *Ap = A + lda * i;
-        for (long l = 0; l < k2; ++l) {
-            float da0 = unhalf(Ap[l].d);
-            __m256i f = load32i(Ap + l);
-            __m256i u = _mm256_sign_epi8(f, f);
-            __m256 d0 = _mm256_set1_ps(unhalf(Bp0[l].d) * da0);
-            __m256 d1 = _mm256_set1_ps(unhalf(Bp1[l].d) * da0);
-            __m256 d2 = _mm256_set1_ps(unhalf(Bp2[l].d) * da0);
-            __m256 d3 = _mm256_set1_ps(unhalf(Bp3[l].d) * da0);
-            __m256 g0 = dotsome(u, _mm256_sign_epi8(load32i(Bp0 + l), f));
-            __m256 g1 = dotsome(u, _mm256_sign_epi8(load32i(Bp1 + l), f));
-            __m256 g2 = dotsome(u, _mm256_sign_epi8(load32i(Bp2 + l), f));
-            __m256 g3 = dotsome(u, _mm256_sign_epi8(load32i(Bp3 + l), f));
-            c0 = _mm256_fmadd_ps(d0, g0, c0);
-            c1 = _mm256_fmadd_ps(d1, g1, c1);
-            c2 = _mm256_fmadd_ps(d2, g2, c2);
-            c3 = _mm256_fmadd_ps(d3, g3, c3);
-        }
-        C[ldc * (j + 0) + i] = hsum8f(c0);
-        C[ldc * (j + 1) + i] = hsum8f(c1);
-        C[ldc * (j + 2) + i] = hsum8f(c2);
-        C[ldc * (j + 3) + i] = hsum8f(c3);
-        END_KERNEL()
-    }
-
-    dontinline void gemm1x1(long m0, long m, long n0, long n) {
-        BEGIN_KERNEL(1, 1)
-        long k2 = k / 32;
-        __m256 c = _mm256_setzero_ps();
-        const T *Ap = A + lda * i;
-        const U *Bp = B + ldb * j;
-        for (long l = 0; l < k2; ++l) {
-            __m256 d = _mm256_set1_ps(unhalf(Ap[l].d) * unhalf(Bp[l].d));
-            __m256i e = load32i(Ap + l);
-            __m256i f = load32i(Bp + l);
-            __m256 g = dotsome(_mm256_sign_epi8(e, e), _mm256_sign_epi8(f, e));
-            c = _mm256_fmadd_ps(d, g, c);
-        }
-        C[ldc * j + i] = hsum8f(c);
-        END_KERNEL()
-    }
-
-    inline __m256 dotsome(__m256i u, __m256i s) {
-        __m256i res;
-        if (avxvnni)
-            res = _mm256_dpbusd_epi32(_mm256_setzero_si256(), u, s);
-        else
-            res = _mm256_madd_epi16(_mm256_set1_epi16(1),
-                                    _mm256_maddubs_epi16(u, s));
-        return _mm256_cvtepi32_ps(res);
-    }
-
-    const long k;
-    const T *const A;
-    const long lda;
-    const U *const B;
-    const long ldb;
-    float *const C;
-    const long ldc;
-    const long ith;
-    const long nth;
-};
-
-#endif // __x86_64__
-
-// computes m×k * n×k → n×m
-void llamafile_sgemm(long m, long n, long k, int dtype, const void *A, long lda,
-                     const void *B, long ldb, float *C, long ldc, long ith,
-                     long nth) {
-    ASSERT(X86_HAVE(FMA));
-    ASSERT(X86_HAVE(AVX2));
-    switch (dtype) {
-#ifdef __x86_64__
-
-    case GGML_TYPE_F32: {
-        tinyBLAS<float> tb{
-            k, (const float *)A, lda, (const float *)B, ldb, C, ldc, ith, nth,
-        };
-        tb.gemm(m, n);
-        break;
-    }
-
-    case GGML_TYPE_F16: {
-        ASSERT(X86_HAVE(F16C));
-        tinyBLAS<ggml_fp16_t> tb{
-            k,   (const ggml_fp16_t *)A,
-            lda, (const ggml_fp16_t *)B,
-            ldb, C,
-            ldc, ith,
-            nth,
-        };
-        tb.gemm(m, n);
-        break;
-    }
-
-    case GGML_TYPE_Q8_0:
-        if (X86_HAVE(AVXVNNI)) {
-            tinyBLASq<block_q8_0, block_q8_0, true> tb{
-                k,   (const block_q8_0 *)A,
-                lda, (const block_q8_0 *)B,
-                ldb, C,
-                ldc, ith,
-                nth,
-            };
-            tb.gemm(m, n);
-        } else {
-            tinyBLASq<block_q8_0, block_q8_0, false> tb{
-                k,   (const block_q8_0 *)A,
-                lda, (const block_q8_0 *)B,
-                ldb, C,
-                ldc, ith,
-                nth,
-            };
-            tb.gemm(m, n);
-        }
-        break;
-
-    case GGML_TYPE_Q4_0:
-        if (X86_HAVE(AVXVNNI)) {
-            tinyBLASq<block_q4_0, block_q8_0, true> tb{
-                k,   (const block_q4_0 *)A,
-                lda, (const block_q8_0 *)B,
-                ldb, C,
-                ldc, ith,
-                nth,
-            };
-            tb.gemm(m, n);
-        } else {
-            tinyBLASq<block_q4_0, block_q8_0, false> tb{
-                k,   (const block_q4_0 *)A,
-                lda, (const block_q8_0 *)B,
-                ldb, C,
-                ldc, ith,
-                nth,
-            };
-            tb.gemm(m, n);
-        }
-        break;
-
+#else
+        sgemm = llamafile_sgemm_unsupported;
+        mixmul = llamafile_mixmul_unsupported;
 #endif
-    default:
-        ASSERT(!"unsupported dtype");
     }
+} funcs;
+
+/**
+ * Performs optimized matrix multiplication on CPU.
+ *
+ * This subroutine may compute C = Aᵀ * B with column major ordering.
+ * Despite its name, this isn't a generalized implementation. Work is
+ * only performed when a handwritten kernel is written and available.
+ * Otherwise the caller should fall back to a general matmul routine.
+ *
+ * @param m is rows in `A` and `C`
+ * @param n is cols in `B` and `C`
+ * @param k is cols in `A` and rows in `B`
+ * @param A is first input matrix (always transposed)
+ * @param lda is row stride of `A`
+ * @param B is second input matrix (never transposed)
+ * @param ldb is row stride of `B`
+ * @param C is input/output array of output matrices
+ * @param ldc is row stride of `C`
+ * @param ith is thread id (must be less than `nth`)
+ * @param nth is number of threads (must be greater than zero)
+ * @param task is GGML task type
+ * @param Atype is GGML data type of `A`
+ * @param Btype is GGML data type of `B`
+ * @param Ctype is GGML data type of `C`
+ * @param precision may be used to control the internal compute type
+ * @return true if this function was able to service the matmul request
+ */
+bool llamafile_sgemm(long m, long n, long k, const void *A, long lda, const void *B, long ldb,
+                     void *C, long ldc, int ith, int nth, int task, int Atype, int Btype, int Ctype,
+                     int precision) {
+    return funcs.sgemm(m, n, k, A, lda, B, ldb, C, ldc, ith, nth, task, Atype, Btype, Ctype,
+                       precision);
+}
+
+/**
+ * Performs "mixture of experts" tensor multiplication on CPU.
+ */
+bool llamafile_mixmul(const ggml_compute_params *params, const ggml_tensor *weights,
+                      const ggml_tensor *thought, const ggml_tensor *plan, ggml_tensor *result) {
+    return funcs.mixmul(params, weights, thought, plan, result);
+}
+
+bool llamafile_mixmul_iqk(long Nx, long Ny, long ne00, int ne11, int typeA, const void *A,
+                          const void *B, float *C, long nb1, long nb2, const void *vrow_mapping,
+                          int ith, int nth) {
+    return funcs.iqk_mixmul(Nx, Ny, ne00, ne11, typeA, A, B, C, nb1, nb2, vrow_mapping, ith, nth);
 }

@@ -16,8 +16,10 @@ void *llamafile_content(struct llamafile *);
 size_t llamafile_tell(struct llamafile *);
 size_t llamafile_size(struct llamafile *);
 FILE *llamafile_fp(struct llamafile *);
+void llamafile_ref(struct llamafile *);
+void llamafile_unref(struct llamafile *);
 
-void llamafile_init(void);
+void llamafile_govern(void);
 void llamafile_check_cpu(void);
 void llamafile_help(const char *);
 void llamafile_log_command(char *[]);
@@ -29,6 +31,8 @@ void llamafile_schlep(const void *, size_t);
 void llamafile_get_app_dir(char *, size_t);
 void llamafile_launch_browser(const char *);
 
+extern bool FLAG_trap;
+extern bool FLAG_precise;
 extern bool FLAG_unsecure;
 
 #define LLAMAFILE_GPU_ERROR -2
@@ -45,11 +49,9 @@ bool llamafile_has_gpu(void);
 int llamafile_gpu_layers(int);
 bool llamafile_has_cuda(void);
 bool llamafile_has_metal(void);
+bool llamafile_has_amd_gpu(void);
 int llamafile_gpu_parse(const char *);
 const char *llamafile_describe_gpu(void);
-
-void llamafile_sgemm(long, long, long, int, const void *, long, const void *,
-                     long, float *, long, long, long);
 
 #ifdef __cplusplus
 }

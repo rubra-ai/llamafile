@@ -18,6 +18,7 @@
 #include "llama.cpp/ggml-backend-impl.h"
 #include "llama.cpp/ggml-cuda.h"
 #include "llama.cpp/ggml-metal.h"
+#include "llamafile/llamafile.h"
 #include "llamafile/log.h"
 #include "llamafile/x.h"
 #include <assert.h>
@@ -45,6 +46,7 @@ __static_yoink("llamafile/llamafile.h");
 __static_yoink("llama.cpp/ggml-cuda.h");
 __static_yoink("llama.cpp/ggml-alloc.h");
 __static_yoink("llama.cpp/ggml-cuda.cu");
+__static_yoink("llama.cpp/ggml-common.h");
 __static_yoink("llama.cpp/ggml-backend.h");
 __static_yoink("llama.cpp/ggml-backend-impl.h");
 
@@ -55,19 +57,23 @@ __static_yoink("llama.cpp/ggml-backend-impl.h");
 
 #define NVCC_LIBS BLAS_ONLY("-lcublas"), "-lcuda"
 
-#define NVCC_FLAGS                                                             \
-    "--shared", "--forward-unknown-to-host-compiler", "-use_fast_math",        \
-        "--compiler-options",                                                  \
-        (!IsWindows()                                                          \
-             ? (!IsAarch64()                                                   \
-                    ? "-fPIC -O3 -march=native -mtune=native"                  \
-                    : "-fPIC -O3 -march=native -mtune=native -ffixed-x28")     \
-             : "/nologo /EHsc /O2 /GR /MT"),                                   \
-        "-DNDEBUG", "-DGGML_BUILD=1", "-DGGML_SHARED=1",                       \
-        "-DGGML_CUDA_MMV_Y=1", "-DGGML_MULTIPLATFORM",                         \
-        "-DGGML_CUDA_DMMV_X=32", "-DK_QUANTS_PER_ITERATION=2",                 \
-        "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128",                                 \
+#define COMMON_FLAGS \
+    /* "-DNDEBUG",  */ "-DGGML_BUILD=1", "-DGGML_SHARED=1", "-DGGML_MULTIPLATFORM", \
+        "-DGGML_CUDA_DMMV_X=32", "-DK_QUANTS_PER_ITERATION=2", \
+        "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128", "-DGGML_CUDA_MMV_Y=1", \
         (FLAG_tinyblas ? "-DGGML_USE_TINYBLAS" : "-DGGML_USE_CUBLAS")
+
+#define NVCC_FLAGS \
+    "-std=c++11", "-O3", "--shared", "--use_fast_math", "--forward-unknown-to-host-compiler", \
+        "--compiler-options", \
+        (!IsWindows() \
+             ? (!IsAarch64() \
+                    ? "-fPIC -O3 -march=native -mtune=native -std=c++11 -Wno-unused-function " \
+                      "-Wno-unused-result -Wno-return-type -Wno-pedantic" \
+                    : "-fPIC -O3 -march=native -mtune=native -std=c++11 -Wno-unused-function " \
+                      "-Wno-unused-result -Wno-return-type -Wno-pedantic -ffixed-x28") \
+             : "/nologo /EHsc /O2 /GR /MT"), \
+        COMMON_FLAGS
 
 static const struct Source {
     const char *zip;
@@ -81,6 +87,7 @@ static const struct Source {
     {"/zip/llama.cpp/ggml-impl.h", "ggml-impl.h"},
     {"/zip/llama.cpp/ggml-cuda.h", "ggml-cuda.h"},
     {"/zip/llama.cpp/ggml-alloc.h", "ggml-alloc.h"},
+    {"/zip/llama.cpp/ggml-common.h", "ggml-common.h"},
     {"/zip/llama.cpp/ggml-backend.h", "ggml-backend.h"},
     {"/zip/llama.cpp/ggml-backend-impl.h", "ggml-backend-impl.h"},
     {"/zip/llama.cpp/ggml-cuda.cu", "ggml-cuda.cu"}, // must come last
@@ -90,23 +97,18 @@ GGML_CALL int ggml_backend_cuda_reg_devices(void);
 
 static struct Cuda {
     bool supported;
+    bool has_amd_gpu;
     atomic_uint once;
     typeof(ggml_cuda_link) *GGML_CALL link;
-    typeof(ggml_init_cublas) *GGML_CALL init;
-    typeof(ggml_cublas_loaded) *GGML_CALL loaded;
-    typeof(ggml_cuda_host_free) *GGML_CALL host_free;
-    typeof(ggml_cuda_host_malloc) *GGML_CALL host_malloc;
-    typeof(ggml_cuda_can_mul_mat) *GGML_CALL can_mul_mat;
-    typeof(ggml_cuda_compute_forward) *GGML_CALL compute_forward;
-    typeof(ggml_cuda_get_device_count) *GGML_CALL get_device_count;
-    typeof(ggml_cuda_get_device_description) *GGML_CALL get_device_description;
     typeof(ggml_backend_cuda_buffer_type) *GGML_CALL buffer_type;
     typeof(ggml_backend_cuda_host_buffer_type) *GGML_CALL host_buffer_type;
     typeof(ggml_backend_cuda_init) *GGML_CALL backend_init;
-    typeof(ggml_backend_cuda_get_device_count) *GGML_CALL get_device_count2;
     typeof(ggml_backend_cuda_split_buffer_type) *GGML_CALL split_buffer_type;
     typeof(ggml_backend_cuda_reg_devices) *GGML_CALL reg_devices;
     typeof(ggml_backend_cuda_get_device_memory) *GGML_CALL get_device_memory;
+    typeof(ggml_backend_cuda_get_device_count) *GGML_CALL get_device_count;
+    typeof(ggml_backend_cuda_unregister_host_buffer) *GGML_CALL unreg_host_buf;
+    typeof(ggml_backend_cuda_register_host_buffer) *GGML_CALL register_host_buffer;
 } ggml_cuda;
 
 static const char *Dlerror(void) {
@@ -118,13 +120,12 @@ static const char *Dlerror(void) {
 }
 
 static const char *GetDsoExtension(void) {
-    if (IsWindows()) {
+    if (IsWindows())
         return "dll";
-    } else if (IsXnu()) {
+    else if (IsXnu())
         return "dylib";
-    } else {
+    else
         return "so";
-    }
 }
 
 static bool FileExists(const char *path) {
@@ -150,8 +151,7 @@ static bool CreateTempPath(const char *path, char tmp[static PATH_MAX]) {
     }
 }
 
-static bool Compile(const char *src, const char *tmp, const char *out,
-                    char *args[]) {
+static bool Compile(const char *src, const char *tmp, const char *out, char *args[]) {
     int pid, ws;
     llamafile_log_command(args);
     errno_t err = posix_spawnp(&pid, args[0], NULL, NULL, args, environ);
@@ -168,8 +168,7 @@ static bool Compile(const char *src, const char *tmp, const char *out,
         }
     }
     if (ws) {
-        tinylog(__func__, ": warning: ", args[0],
-                " returned nonzero exit status\n", NULL);
+        tinylog(__func__, ": warning: ", args[0], " returned nonzero exit status\n", NULL);
         unlink(tmp);
         return false;
     }
@@ -186,26 +185,22 @@ static bool get_rocm_bin_path(char path[static PATH_MAX], const char *bin) {
     // create filename of executable
     char name[NAME_MAX];
     strlcpy(name, bin, PATH_MAX);
-    if (IsWindows()) {
+    if (IsWindows())
         strlcat(name, ".exe", PATH_MAX);
-    }
 
     // search for it on $PATH
-    if (commandv(name, path, PATH_MAX)) {
+    if (commandv(name, path, PATH_MAX))
         return path;
-    } else {
+    else
         tinylog(__func__, ": note: ", name, " not found on $PATH\n", NULL);
-    }
 
     // 1. use $HIP_PATH/bin/$name if it exists
     // 2. use /opt/rocm/bin/$name if it exists
     const char *hip_path = getenv("HIP_PATH");
     if (!hip_path) {
-        tinylog(__func__, ": note: $HIP_PATH/bin/", name, " does not exist\n",
-                NULL);
+        tinylog(__func__, ": note: $HIP_PATH/bin/", name, " does not exist\n", NULL);
         if (!FileExists((hip_path = "/opt/rocm"))) {
-            tinylog(__func__, ": note: /opt/rocm/bin/", name,
-                    " does not exist\n", NULL);
+            tinylog(__func__, ": note: /opt/rocm/bin/", name, " does not exist\n", NULL);
             return false;
         }
     }
@@ -217,6 +212,73 @@ static bool get_rocm_bin_path(char path[static PATH_MAX], const char *bin) {
     } else {
         tinylog(__func__, ": note: ", path, " does not exist\n", NULL);
         return false;
+    }
+}
+
+struct StringListEntry {
+    char *string;
+    struct StringListEntry *next;
+};
+
+struct StringList {
+    struct StringListEntry *head;
+    struct StringListEntry *tail;
+    size_t length;
+};
+
+static int StringCompare(const void *a, const void *b) {
+    return strcmp(*(const char **)a, *(const char **)b);
+}
+
+static void AddStringToStringList(struct StringList *string_list, char *string,
+                                  size_t string_length) {
+    struct StringListEntry *new_entry = malloc(sizeof(struct StringListEntry));
+    new_entry->string = malloc(sizeof(char) * (string_length + 1));
+    strncpy(new_entry->string, string, string_length);
+    new_entry->string[string_length] = '\0';
+    new_entry->next = NULL;
+    if (string_list->head == NULL) {
+        string_list->head = new_entry;
+    } else {
+        string_list->tail->next = new_entry;
+    }
+    string_list->tail = new_entry;
+    ++string_list->length;
+}
+
+static void CopyStringListToStringArray(struct StringList *string_list, char ***string_array) {
+    *string_array = malloc(sizeof(char *) * string_list->length);
+    struct StringListEntry *current = string_list->head;
+    int i = 0;
+    while (current != NULL) {
+        (*string_array)[i] = current->string;
+        current = current->next;
+        ++i;
+    }
+}
+
+static int RemoveDuplicatesFromSortedStringArray(char **strings, int num_strings) {
+    if (num_strings == 1)
+        return 1;
+    int tail = 0;
+    for (int current = 1; current < num_strings; ++current) {
+        if (strcmp(strings[tail], strings[current]) != 0) {
+            strings[tail + 1] = strings[current];
+            ++tail;
+        } else {
+            strings[current] = NULL;
+        }
+    }
+    return tail + 1;
+}
+
+static void FreeStringList(struct StringList *string_list) {
+    struct StringListEntry *current = string_list->head;
+    while (current != NULL) {
+        struct StringListEntry *next = current->next;
+        free(current->string);
+        free(current);
+        current = next;
     }
 }
 
@@ -260,52 +322,39 @@ static bool get_amd_offload_arch_flag(char out[static 64]) {
 
     // Parse program output to word-encoded array.
     int rc;
-    int a = 0;
     int t = 0;
     char buf[512];
-    unsigned long archs = 0;
+    char name[64] = {'g', 'f', 'x'};
+    int j = 3;
+    struct StringList name_list = {NULL, NULL, 0};
     while ((rc = read(pipefds[0], buf, sizeof(buf))) > 0) {
         for (int i = 0; i < rc; ++i) {
             switch (t) {
             case 0:
-                if (buf[i] == 'g') {
+                if (buf[i] == 'g')
                     t = 1;
-                }
                 break;
             case 1:
-                if (buf[i] == 'f') {
+                if (buf[i] == 'f')
                     t = 2;
-                } else {
+                else
                     t = 0;
-                }
                 break;
             case 2:
                 if (buf[i] == 'x') {
                     t = 3;
-                    a = 0;
                 } else {
                     t = 0;
                 }
                 break;
             case 3:
-                if (isdigit(buf[i])) {
-                    a *= 10;
-                    a += buf[i] - '0';
+                if (isalnum(buf[i])) {
+                    name[j] = buf[i];
+                    ++j;
                 } else {
+                    AddStringToStringList(&name_list, name, j);
                     t = 0;
-                    if ((a & 0xffff) && (a & 0xffff) == a) {
-                        a &= 0xffff;
-                        bool dupe = false;
-                        for (int j = 0; j < 4; ++j) {
-                            if (((archs >> (j * 16)) & 0xffff) == a) {
-                                dupe = true;
-                            }
-                        }
-                        if (!dupe) {
-                            archs <<= 16;
-                            archs |= a;
-                        }
-                    }
+                    j = 3;
                 }
                 break;
             default:
@@ -324,26 +373,31 @@ static bool get_amd_offload_arch_flag(char out[static 64]) {
         }
     }
     if (ws) {
-        tinylog(__func__, ": error: hipInfo returned non-zero exit status\n",
-                NULL);
+        tinylog(__func__, ": error: hipInfo returned non-zero exit status\n", NULL);
         return false;
     }
 
     // Serialize value for --offload-arch=LIST flag.
-    if (!archs) {
-        tinylog(__func__,
-                ": warning: hipInfo output didn't list any graphics cards\n",
-                NULL);
+    if (name_list.length == 0) {
+        tinylog(__func__, ": warning: hipInfo output didn't list any graphics cards\n", NULL);
         return false;
     }
-    bool gotsome = false;
     char *p = stpcpy(out, "--offload-arch=");
-    do {
-        if (gotsome)
+    char **names = NULL;
+
+    CopyStringListToStringArray(&name_list, &names);
+    qsort(names, name_list.length, sizeof(char *), StringCompare);
+
+    int num_names = RemoveDuplicatesFromSortedStringArray(names, name_list.length);
+
+    for (int i = 0; i < num_names; ++i) {
+        if (i > 0)
             *p++ = ',';
-        p += sprintf(p, "gfx%d", archs & 0xffff);
-        gotsome = true;
-    } while ((archs >>= 16));
+        p += sprintf(p, "%s", names[i]);
+    }
+
+    FreeStringList(&name_list);
+    free(names);
 
     // woot
     return true;
@@ -359,11 +413,10 @@ static bool get_amd_offload_arch_flag(char out[static 64]) {
 // set $CUDA_PATH to empty string to disable cuda
 static bool get_nvcc_path(char path[static PATH_MAX]) {
     const char *name = IsWindows() ? "nvcc.exe" : "nvcc";
-    if (commandv(name, path, PATH_MAX)) {
+    if (commandv(name, path, PATH_MAX))
         return true;
-    } else {
+    else
         tinylog(__func__, ": note: ", name, " not found on $PATH\n", NULL);
-    }
     const char *cuda_path;
     if ((cuda_path = getenv("CUDA_PATH"))) {
         if (!*cuda_path)
@@ -371,13 +424,11 @@ static bool get_nvcc_path(char path[static PATH_MAX]) {
         strlcpy(path, cuda_path, PATH_MAX);
         strlcat(path, "/bin/", PATH_MAX);
     } else {
-        tinylog(__func__, ": note: $CUDA_PATH/bin/", name, " does not exist\n",
-                NULL);
+        tinylog(__func__, ": note: $CUDA_PATH/bin/", name, " does not exist\n", NULL);
         if (FileExists("/opt/cuda")) {
             strlcpy(path, "/opt/cuda/bin/", PATH_MAX);
         } else {
-            tinylog(__func__, ": note: /opt/cuda/bin/", name,
-                    " does not exist\n", NULL);
+            tinylog(__func__, ": note: /opt/cuda/bin/", name, " does not exist\n", NULL);
             strlcpy(path, "/usr/local/cuda/bin/", PATH_MAX);
         }
     }
@@ -390,8 +441,7 @@ static bool get_nvcc_path(char path[static PATH_MAX]) {
     }
 }
 
-static dontinline bool get_nvcc_arch_flag(const char *nvcc,
-                                          char flag[static 32]) {
+static dontinline bool get_nvcc_arch_flag(const char *nvcc, char flag[static 32]) {
 
     // create path of exe
     char exe[PATH_MAX];
@@ -405,9 +455,8 @@ static dontinline bool get_nvcc_arch_flag(const char *nvcc,
 
     // create temporary path for output
     char tmp[PATH_MAX];
-    if (!CreateTempPath(exe, tmp)) {
+    if (!CreateTempPath(exe, tmp))
         return false;
-    }
 
     // build nvidia compute capability detector
     // https://stackoverflow.com/a/40695640/1653720
@@ -420,11 +469,9 @@ static dontinline bool get_nvcc_arch_flag(const char *nvcc,
     // nvidia-smi in cuda 11.5+ can do this but (1) it takes longer to
     // run than compiling / running this script and (2) the nvidia-smi
     // command isn't available on Jetson devices.
-    tinylog(__func__,
-            ": note: building nvidia compute capability detector...\n", NULL);
-    if (!Compile(src, tmp, exe, (char *[]){(char *)nvcc, "-o", tmp, src, 0})) {
+    tinylog(__func__, ": note: building nvidia compute capability detector...\n", NULL);
+    if (!Compile(src, tmp, exe, (char *[]){(char *)nvcc, "-o", tmp, src, 0}))
         return false;
-    }
 
     // create pipe
     int pipefds[2];
@@ -470,8 +517,7 @@ static dontinline bool get_nvcc_arch_flag(const char *nvcc,
     // parse output of detector
     char *endptr;
     if (!*ibuf || !strtol(ibuf, &endptr, 10) || *endptr) {
-        tinylog(__func__, ": error: bad compute capability detector output\n",
-                NULL);
+        tinylog(__func__, ": error: bad compute capability detector output\n", NULL);
         return false;
     }
 
@@ -480,8 +526,8 @@ static dontinline bool get_nvcc_arch_flag(const char *nvcc,
     return true;
 }
 
-static bool compile_amd_windows(const char *clangxx, const char *dso,
-                                const char *src, const char *tmpdso) {
+static bool compile_amd_windows(const char *clangxx, const char *dso, const char *src,
+                                const char *tmpdso) {
     const char *lib = IsWindows() ? "lib" : GetDsoExtension();
     const char *hip_path = getenv("HIP_PATH");
 
@@ -500,22 +546,20 @@ static bool compile_amd_windows(const char *clangxx, const char *dso,
         (char *)clangxx,
         "-O3",
         "-shared",
-        "-DNDEBUG",
         "-x",
         "hip",
         "--hip-link",
         "-std=gnu++14",
         "-fuse-ld=lld",
-        "-DGGML_BUILD=1",
-        "-DGGML_SHARED=1",
         "-DGGML_USE_HIPBLAS",
+        "-Wno-return-type",
+        "-Wno-unused-result",
+        "-Wno-unused-function",
+        "-Wno-expansion-to-defined",
         (char *)offload_arch,
-        "-DGGML_CUDA_MMV_Y=1",
-        "-DGGML_MULTIPLATFORM",
-        "-DGGML_CUDA_DMMV_X=32",
         "-Wno-ignored-attributes",
         "-D_CRT_SECURE_NO_WARNINGS",
-        "-DK_QUANTS_PER_ITERATION=2",
+        COMMON_FLAGS,
         "-o",
         (char *)tmpdso,
         (char *)src,
@@ -525,7 +569,6 @@ static bool compile_amd_windows(const char *clangxx, const char *dso,
         "-amdgpu-function-calls=false",
         "-mllvm",
         "-amdgpu-early-inline-all=true",
-        FLAG_tinyblas ? "-DGGML_USE_TINYBLAS" : "-DIGNORE",
         "-isystem",
         gc(xasprintf("%s/include", hip_path)),
         BLAS_ONLY("-l"),
@@ -540,39 +583,30 @@ static bool compile_amd_windows(const char *clangxx, const char *dso,
     return Compile(src, tmpdso, dso, args);
 }
 
-static bool compile_amd_unix(const char *dso, const char *src,
-                             const char *tmpdso) {
+static bool compile_amd_unix(const char *dso, const char *src, const char *tmpdso) {
 
     // get set of microarchitectures for all installed graphics cards
     // it's possible to safe --offload-arch=native but we do it ourself
     // the amdgpu-arch that hipcc runs fails to link libhsa-runtime64.so
     char offload_arch[64];
-    if (!get_amd_offload_arch_flag(offload_arch)) {
+    if (!get_amd_offload_arch_flag(offload_arch))
         strcpy(offload_arch, "--offload-arch=native");
-    }
 
     char *args[] = {
         "hipcc",
         "-O3",
         "-fPIC",
         "-shared",
-        "-DNDEBUG",
         offload_arch,
         "-march=native",
         "-mtune=native",
-        "-use_fast_math",
-        "-DGGML_BUILD=1",
-        "-DGGML_SHARED=1",
+        "-DGGML_USE_HIPBLAS",
         "-Wno-return-type",
         "-Wno-unused-result",
-        "-DGGML_USE_HIPBLAS",
-        "-DGGML_CUDA_MMV_Y=1",
-        "-DGGML_MULTIPLATFORM",
-        "-DGGML_CUDA_DMMV_X=32",
+        "-Wno-unused-function",
+        "-Wno-expansion-to-defined",
         ARMS_ONLY("-ffixed-x28"),
-        "-DK_QUANTS_PER_ITERATION=2",
-        "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128",
-        FLAG_tinyblas ? "-DGGML_USE_TINYBLAS" : "-DIGNORE",
+        COMMON_FLAGS,
         "-o",
         (char *)tmpdso,
         (char *)src,
@@ -587,46 +621,38 @@ static bool compile_amd(const char *clangxx, const char *dso, const char *src) {
 
     // create temporary output path for atomicity
     char tmpdso[PATH_MAX];
-    if (!CreateTempPath(dso, tmpdso)) {
+    if (!CreateTempPath(dso, tmpdso))
         return false;
-    }
 
-    if (!IsWindows()) {
+    if (!IsWindows())
         return compile_amd_unix(dso, src, tmpdso);
-    } else {
+    else
         return compile_amd_windows(clangxx, dso, src, tmpdso);
-    }
 }
 
 static bool compile_nvidia(const char *nvcc, const char *dso, const char *src) {
 
     // create temporary output path for atomicity
     char tmpdso[PATH_MAX];
-    if (!CreateTempPath(dso, tmpdso)) {
+    if (!CreateTempPath(dso, tmpdso))
         return false;
-    }
 
     // try building dso with host nvidia microarchitecture
-    tinylog(__func__, ": note: building ggml-cuda with nvcc -arch=native...\n",
-            NULL);
+    tinylog(__func__, ": note: building ggml-cuda with nvcc -arch=native...\n", NULL);
     if (Compile(src, tmpdso, dso,
-                (char *[]){(char *)nvcc, "-arch=native", NVCC_FLAGS, "-o",
-                           tmpdso, (char *)src, NVCC_LIBS, NULL})) {
+                (char *[]){(char *)nvcc, "-arch=native", NVCC_FLAGS, "-o", tmpdso, (char *)src,
+                           NVCC_LIBS, NULL}))
         return true;
-    }
 
     // try again with different arch flag
     char archflag[32];
-    if (!get_nvcc_arch_flag(nvcc, archflag)) {
+    if (!get_nvcc_arch_flag(nvcc, archflag))
         return false;
-    }
-    tinylog(__func__, ": note: building ggml-cuda with nvcc ", archflag,
-            "...\n", NULL);
+    tinylog(__func__, ": note: building ggml-cuda with nvcc ", archflag, "...\n", NULL);
     if (Compile(src, tmpdso, dso,
-                (char *[]){(char *)nvcc, archflag, NVCC_FLAGS, "-o", tmpdso,
-                           (char *)src, NVCC_LIBS, NULL})) {
+                (char *[]){(char *)nvcc, archflag, NVCC_FLAGS, "-o", tmpdso, (char *)src, NVCC_LIBS,
+                           NULL}))
         return true;
-    }
 
     // oh no
     return false;
@@ -641,8 +667,7 @@ static bool extract_cuda_dso(const char *dso, const char *name) {
     strlcat(zip, ".", sizeof(zip));
     strlcat(zip, GetDsoExtension(), sizeof(zip));
     if (!FileExists(zip)) {
-        tinylog(__func__, ": note: prebuilt binary ", zip, " not found\n",
-                NULL);
+        tinylog(__func__, ": note: prebuilt binary ", zip, " not found\n", NULL);
         return false;
     }
 
@@ -652,10 +677,8 @@ static bool extract_cuda_dso(const char *dso, const char *name) {
 
 static void *imp(void *lib, const char *sym) {
     void *fun = cosmo_dlsym(lib, sym);
-    if (!fun) {
-        tinylog(__func__, ": error: failed to import symbol: ", sym, "\n",
-                NULL);
-    }
+    if (!fun)
+        tinylog(__func__, ": error: failed to import symbol: ", sym, "\n", NULL);
     return fun;
 }
 
@@ -672,60 +695,40 @@ static bool link_cuda_dso(const char *dso, const char *dir) {
     void *lib;
     tinylog(__func__, ": note: dynamically linking ", dso, "\n", NULL);
     lib = cosmo_dlopen(dso, RTLD_LAZY);
-    if (dir) {
+    if (dir)
         chdir(cwd);
-    }
     if (!lib) {
         char cc[PATH_MAX];
-        tinylog(__func__, ": warning: ", Dlerror(),
-                ": failed to load library\n", NULL);
-        if ((IsLinux() || IsBsd()) && !commandv("cc", cc, PATH_MAX)) {
-            tinylog(__func__,
-                    ": note: you need to install cc for gpu support\n", NULL);
-        }
+        tinylog(__func__, ": warning: ", Dlerror(), ": failed to load library\n", NULL);
+        if ((IsLinux() || IsBsd()) && !commandv("cc", cc, PATH_MAX))
+            tinylog(__func__, ": note: you need to install cc for gpu support\n", NULL);
         return false;
     }
 
     // import functions
     bool ok = true;
     ok &= !!(ggml_cuda.link = imp(lib, "ggml_cuda_link"));
-    ok &= !!(ggml_cuda.init = imp(lib, "ggml_init_cublas"));
-    ok &= !!(ggml_cuda.loaded = imp(lib, "ggml_cublas_loaded"));
-    ok &= !!(ggml_cuda.host_free = imp(lib, "ggml_cuda_host_free"));
-    ok &= !!(ggml_cuda.host_malloc = imp(lib, "ggml_cuda_host_malloc"));
-    ok &= !!(ggml_cuda.can_mul_mat = imp(lib, "ggml_cuda_can_mul_mat"));
-    ok &= !!(ggml_cuda.compute_forward = imp(lib, "ggml_cuda_compute_forward"));
-    ok &=
-        !!(ggml_cuda.get_device_count = imp(lib, "ggml_cuda_get_device_count"));
-    ok &= !!(ggml_cuda.get_device_description =
-                 imp(lib, "ggml_cuda_get_device_description"));
-    ok &= !!(ggml_cuda.host_buffer_type =
-                 imp(lib, "ggml_backend_cuda_host_buffer_type"));
+    ok &= !!(ggml_cuda.host_buffer_type = imp(lib, "ggml_backend_cuda_host_buffer_type"));
     ok &= !!(ggml_cuda.buffer_type = imp(lib, "ggml_backend_cuda_buffer_type"));
     ok &= !!(ggml_cuda.backend_init = imp(lib, "ggml_backend_cuda_init"));
-    ok &= !!(ggml_cuda.get_device_count2 =
-                 imp(lib, "ggml_backend_cuda_get_device_count"));
-    ok &= !!(ggml_cuda.split_buffer_type =
-                 imp(lib, "ggml_backend_cuda_split_buffer_type"));
+    ok &= !!(ggml_cuda.split_buffer_type = imp(lib, "ggml_backend_cuda_split_buffer_type"));
     ok &= !!(ggml_cuda.reg_devices = imp(lib, "ggml_backend_cuda_reg_devices"));
-    ok &= !!(ggml_cuda.get_device_memory =
-                 imp(lib, "ggml_backend_cuda_get_device_memory"));
+    ok &= !!(ggml_cuda.get_device_memory = imp(lib, "ggml_backend_cuda_get_device_memory"));
+    ok &= !!(ggml_cuda.get_device_count = imp(lib, "ggml_backend_cuda_get_device_count"));
+    ok &= !!(ggml_cuda.unreg_host_buf = imp(lib, "ggml_backend_cuda_unregister_host_buffer"));
+    ok &= !!(ggml_cuda.register_host_buffer = imp(lib, "ggml_backend_cuda_register_host_buffer"));
     if (!ok) {
-        tinylog(__func__, ": error: not all cuda symbols could be imported\n",
-                NULL);
+        tinylog(__func__, ": error: not all cuda symbols could be imported\n", NULL);
         cosmo_dlclose(lib);
         return false;
     }
 
     // ask the library if actual gpu devices exist
-    ggml_cuda.link(ggml_backend_api());
-    tinylog(__func__, ": GPU support linked\n", NULL);
-    ggml_cuda.init();
-    if (ggml_cuda.loaded()) {
+    if (ggml_cuda.link(ggml_backend_api())) {
         tinylog(__func__, ": GPU support loaded\n", NULL);
         return true;
     } else {
-        tinylog(__func__, ": GPU support not possible\n", NULL);
+        tinylog(__func__, ": No GPU devices found\n", NULL);
         cosmo_dlclose(lib);
         return false;
     }
@@ -734,9 +737,8 @@ static bool link_cuda_dso(const char *dso, const char *dir) {
 static bool import_cuda_impl(void) {
 
     // No dynamic linking support on OpenBSD yet.
-    if (IsOpenbsd()) {
+    if (IsOpenbsd())
         return false;
-    }
 
     // Check if we're allowed to even try.
     switch (FLAG_gpu) {
@@ -754,7 +756,7 @@ static bool import_cuda_impl(void) {
     bool needs_rebuild = FLAG_recompile;
     for (int i = 0; i < sizeof(srcs) / sizeof(*srcs); ++i) {
         llamafile_get_app_dir(src, sizeof(src));
-        if (!i && mkdir(src, 0755) && errno != EEXIST) {
+        if (!i && makedirs(src, 0755)) {
             perror(src);
             return false;
         }
@@ -766,9 +768,8 @@ static bool import_cuda_impl(void) {
             break;
         case true:
             needs_rebuild = true;
-            if (!llamafile_extract(srcs[i].zip, src)) {
+            if (!llamafile_extract(srcs[i].zip, src))
                 return false;
-            }
             break;
         default:
             __builtin_unreachable();
@@ -808,6 +809,7 @@ static bool import_cuda_impl(void) {
         if (FLAG_nocompile) {
             if ((FileExists(dso) || extract_cuda_dso(dso, "ggml-rocm")) &&
                 link_cuda_dso(dso, library_path)) {
+                ggml_cuda.has_amd_gpu = true;
                 return true;
             } else {
                 goto TryNvidia;
@@ -821,6 +823,7 @@ static bool import_cuda_impl(void) {
                 return false;
             case false:
                 if (link_cuda_dso(dso, library_path)) {
+                    ggml_cuda.has_amd_gpu = true;
                     return true;
                 } else {
                     goto TryNvidia;
@@ -836,6 +839,7 @@ static bool import_cuda_impl(void) {
         if (compiler_path) {
             if (compile_amd(compiler_path, dso, src)) {
                 if (link_cuda_dso(dso, library_path)) {
+                    ggml_cuda.has_amd_gpu = true;
                     return true;
                 } else {
                     goto TryNvidia;
@@ -851,6 +855,7 @@ static bool import_cuda_impl(void) {
         // Try extracting prebuilt tinyBLAS DSO from PKZIP.
         if (extract_cuda_dso(dso, "ggml-rocm")) {
             if (link_cuda_dso(dso, library_path)) {
+                ggml_cuda.has_amd_gpu = true;
                 return true;
             } else {
                 goto TryNvidia;
@@ -884,10 +889,9 @@ TryNvidia:
         llamafile_get_app_dir(dso, PATH_MAX);
         strlcat(dso, "ggml-cuda.", PATH_MAX);
         strlcat(dso, GetDsoExtension(), PATH_MAX);
-        if (FLAG_nocompile) {
+        if (FLAG_nocompile)
             return ((FileExists(dso) || extract_cuda_dso(dso, "ggml-cuda")) &&
                     link_cuda_dso(dso, library_path));
-        }
 
         // Check if DSO is already compiled.
         if (!needs_rebuild && !FLAG_recompile) {
@@ -904,14 +908,12 @@ TryNvidia:
         }
 
         // Try building CUDA from source with mighty cuBLAS.
-        if (compiler_path && compile_nvidia(compiler_path, dso, src)) {
+        if (compiler_path && compile_nvidia(compiler_path, dso, src))
             return link_cuda_dso(dso, library_path);
-        }
 
         // Try extracting prebuilt tinyBLAS DSO from PKZIP.
-        if (extract_cuda_dso(dso, "ggml-cuda")) {
+        if (extract_cuda_dso(dso, "ggml-cuda"))
             return link_cuda_dso(dso, library_path);
-        }
 
         break;
     default:
@@ -923,15 +925,13 @@ TryNvidia:
 }
 
 static void import_cuda(void) {
-    if (llamafile_has_metal()) {
+    if (llamafile_has_metal())
         return;
-    }
     if (import_cuda_impl()) {
         ggml_cuda.supported = true;
-    } else if (FLAG_gpu == LLAMAFILE_GPU_AMD ||
-               FLAG_gpu == LLAMAFILE_GPU_NVIDIA) {
-        tinyprint(2, "fatal error: support for --gpu ",
-                  llamafile_describe_gpu(), FLAG_tinyblas ? " --tinyblas" : "",
+    } else if (FLAG_gpu == LLAMAFILE_GPU_AMD || FLAG_gpu == LLAMAFILE_GPU_NVIDIA) {
+        tinyprint(2, "fatal error: support for --gpu ", llamafile_describe_gpu(),
+                  FLAG_tinyblas ? " --tinyblas" : "",
                   " was explicitly requested, but it wasn't available\n", NULL);
         exit(1);
     }
@@ -942,57 +942,9 @@ bool llamafile_has_cuda(void) {
     return ggml_cuda.supported;
 }
 
-GGML_CALL void ggml_init_cublas(void) {
-    if (!llamafile_has_cuda())
-        return;
-    return ggml_cuda.init();
-}
-
-GGML_CALL bool ggml_cublas_loaded(void) {
-    if (!llamafile_has_cuda())
-        return false;
-    return ggml_cuda.loaded();
-}
-
-GGML_CALL void *ggml_cuda_host_malloc(size_t n) {
-    if (!llamafile_has_cuda())
-        return NULL;
-    return ggml_cuda.host_malloc(n);
-}
-
-GGML_CALL void ggml_cuda_host_free(void *data) {
-    if (!llamafile_has_cuda())
-        return;
-    return ggml_cuda.host_free(data);
-}
-
-GGML_CALL bool ggml_cuda_can_mul_mat(const struct ggml_tensor *src0,
-                                     const struct ggml_tensor *src1,
-                                     struct ggml_tensor *dst) {
-    if (!llamafile_has_cuda())
-        return false;
-    return ggml_cuda.can_mul_mat(src0, src1, dst);
-}
-
-GGML_CALL bool ggml_cuda_compute_forward(struct ggml_compute_params *params,
-                                         struct ggml_tensor *tensor) {
-    if (!llamafile_has_cuda())
-        return false;
-    return ggml_cuda.compute_forward(params, tensor);
-}
-
-GGML_CALL int ggml_cuda_get_device_count(void) {
-    if (!llamafile_has_cuda())
-        return 0;
-    return ggml_cuda.get_device_count();
-}
-
-GGML_CALL void ggml_cuda_get_device_description(int device, char *description,
-                                                size_t description_size) {
-    if (!llamafile_has_cuda())
-        return;
-    return ggml_cuda.get_device_description(device, description,
-                                            description_size);
+bool llamafile_has_amd_gpu(void) {
+    cosmo_once(&ggml_cuda.once, import_cuda);
+    return ggml_cuda.has_amd_gpu;
 }
 
 GGML_CALL ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
@@ -1013,12 +965,6 @@ GGML_CALL ggml_backend_t ggml_backend_cuda_init(int device) {
     return ggml_cuda.backend_init(device);
 }
 
-GGML_CALL int ggml_backend_cuda_get_device_count(void) {
-    if (!llamafile_has_cuda())
-        return 0;
-    return ggml_cuda.get_device_count();
-}
-
 GGML_CALL ggml_backend_buffer_type_t
 ggml_backend_cuda_split_buffer_type(const float *tensor_split) {
     if (!llamafile_has_cuda())
@@ -1032,9 +978,26 @@ GGML_CALL int ggml_backend_cuda_reg_devices(void) {
     return ggml_cuda.reg_devices();
 }
 
-GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t *free,
-                                                   size_t *total) {
+GGML_CALL void ggml_backend_cuda_get_device_memory(int device, size_t *free, size_t *total) {
     if (!llamafile_has_cuda())
         return;
     return ggml_cuda.get_device_memory(device, free, total);
+}
+
+GGML_CALL int ggml_backend_cuda_get_device_count(void) {
+    if (!llamafile_has_cuda())
+        return 0;
+    return ggml_cuda.get_device_count();
+}
+
+GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void *buffer) {
+    if (!llamafile_has_cuda())
+        return;
+    return ggml_cuda.unreg_host_buf(buffer);
+}
+
+GGML_CALL bool ggml_backend_cuda_register_host_buffer(void *buffer, size_t size) {
+    if (!llamafile_has_cuda())
+        return false;
+    return ggml_cuda.register_host_buffer(buffer, size);
 }
