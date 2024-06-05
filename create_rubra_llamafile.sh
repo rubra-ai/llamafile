@@ -1,8 +1,10 @@
 gmake -j8 && sudo gmake install PREFIX=/usr/local
 
 # download model if it hasn't been downloaded yet
-if [ ! -f "openhermes-2.5-neural-chat-v3-3-slerp.Q6_K.gguf" ]; then
-    wget "https://huggingface.co/TheBloke/OpenHermes-2.5-neural-chat-v3-3-Slerp-GGUF/resolve/main/openhermes-2.5-neural-chat-v3-3-slerp.Q6_K.gguf"
+# Mistral-7B-Instruct-v0.3-Q6_K.gguf
+# rubra-Mistral-7B-Instruct-v0.2-fc-json_v1-v6.gguf
+if [ ! -f "rubra-Mistral-7B-Instruct-v0.2-fc-json_v1-v6.gguf" ]; then
+    wget "https://huggingface.co/yingbei/rubra-Mistral-7B-Instruct-v0.2-fc-json_v1-v6.gguf/resolve/main/rubra-Mistral-7B-Instruct-v0.2-fc-json_v1-v6.gguf"
 fi
 
 # copy the base llamafile
@@ -11,7 +13,7 @@ cp .args_llm .args
 # package everything up
 zipalign -j0 \
   rubra.llamafile \
-  openhermes-2.5-neural-chat-v3-3-slerp.Q6_K.gguf \
+  rubra-Mistral-7B-Instruct-v0.2-fc-json_v1-v6.gguf \
   .args
 
 rm .args

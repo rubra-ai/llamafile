@@ -12,59 +12,12 @@
 
 #include "llama.cpp/json.h"
 #include "utils.h"
+#include "function-call.h"
+#include "function-call-parser.h"
 
 #define DEFAULT_OAICOMPAT_MODEL "gpt-3.5-turbo-0613"
 
 using json = nlohmann::json;
-const char* myGrammar = R"(
-root ::= Function
-Function ::= Chat | FileKnowledge | GoogleSearch
-Chat ::= "{"   ws   "\"choice\":"   ws   "\"Chat\","   ws   "\"content\":"   ws   string   "}"
-FileKnowledge ::= "{"   ws   "\"function\":"   ws   "\"FileKnowledge\","   ws   "\"args\":"   ws   object   "}"
-GoogleSearch ::= "{"   ws   "\"function\":"   ws   "\"GoogleSearchTool\","   ws   "\"args\":"   ws   object   "}"
-
-value  ::= object | array | string | number | ("true" | "false" | "null") ws
-
-object ::=
-  "{" ws (
-            string ":" ws value
-    ("," ws string ":" ws value)*
-  )? "}" ws
-
-array  ::=
-  "[" ws (
-            value
-    ("," ws value)*
-  )? "]" ws
-
-string ::=
-  "\"" (
-    [^"\\] |
-    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes
-  )* "\"" ws
-
-number ::= ("-"? ([0-9] | [1-9] [0-9]*)) ("." [0-9]+)? ([eE] [-+]? [0-9]+)? ws
-
-# Optional space: by convention, applied in this grammar after literal chars when allowed
-ws ::= ([ ] ws)?
-)";
-
-
-const char* webGrammar = R"(
-root ::= True | False
-True::= string
-False ::= "Not enough information"
-
-string ::=
-  (
-    [^"\\] |
-    "\\" (["\\/bfnrt] | "u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]) # escapes
-  )* ws
-
-# Optional space: by convention, applied in this grammar after literal chars when allowed
-ws ::= ([ ] ws)?
-)";
-
 
 
 
@@ -76,6 +29,8 @@ inline static json oaicompat_completion_params_parse(
     json llama_params;
 
     llama_params["__oaicompat"] = true;
+    json tool_name_map;
+    const std::vector<json> expanded_messages = expand_messages(body, tool_name_map);
 
     // Map OpenAI parameters to llama.cpp parameters
     //
@@ -86,7 +41,8 @@ inline static json oaicompat_completion_params_parse(
     // https://platform.openai.com/docs/api-reference/chat/create
     llama_sampling_params default_sparams;
     llama_params["model"]             = json_value(body, "model", std::string("unknown"));
-    llama_params["prompt"]            = format_chat(model, chat_template, body["messages"]);
+    // llama_params["prompt"]            = format_chat(model, chat_template, body["messages"]);
+    llama_params["prompt"]            = format_chat(model, chat_template, expanded_messages);
     llama_params["cache_prompt"]      = json_value(body, "cache_prompt", false);
     llama_params["temperature"]       = json_value(body, "temperature", 0.0);
     llama_params["top_k"]             = json_value(body, "top_k", default_sparams.top_k);
@@ -109,26 +65,6 @@ inline static json oaicompat_completion_params_parse(
     // if (body.count("grammar") != 0) {
     //     llama_params["grammar"] = json_value(body, "grammar", json::object());
     // }
-
-
-    if (body.count("response_format") != 0) { 
-        std::cout << "Using Grammar!" << std::endl;
-        if (body["response_format"].is_string()) {
-            std::cout << "Using Custom Grammar:" << std::endl;
-            if (body["response_format"] == "web") {
-                llama_params["grammar"] = webGrammar;
-                std::cout << webGrammar << std::endl;
-            } else {
-                llama_params["grammar"] = body["response_format"];
-                std::cout << body["response_format"] << std::endl;
-            }
-            
-        } else {// TODO: need to verify if the value is {"type": "json_object"}
-            llama_params["grammar"] = myGrammar;
-        }
-    } else {
-        std::cout << "Not Using Grammar!" << std::endl;
-    }
     
     // Handle 'stop' field
     if (body.contains("stop") && body["stop"].is_string()) {
@@ -139,6 +75,7 @@ inline static json oaicompat_completion_params_parse(
 
     // Ensure there is ChatML-specific end sequence among stop words
     llama_params["stop"].push_back("<|im_end|>");
+    printf("stop: %s", llama_params["stop"].dump().c_str());
 
     return llama_params;
 }
@@ -153,33 +90,63 @@ inline static json format_final_response_oaicompat(const json &request, const ta
     int num_prompt_tokens    = json_value(result, "tokens_evaluated", 0);
     std::string content      = json_value(result, "content", std::string(""));
 
+    std::vector<json> parsed_content = rubra_fc_json_tool_extractor(content);
+
     std::string finish_reason = "length";
     if (stopped_word || stopped_eos) {
         finish_reason = "stop";
     }
 
-    json choices =
-        streaming ? json::array({json{{"finish_reason", finish_reason},
-                                        {"index", 0},
-                                        {"delta", json::object()}}})
-                  : json::array({json{{"finish_reason", finish_reason},
+    json choices;
+
+    if (streaming) {
+        choices = json::array({json{{"finish_reason", finish_reason},
+                                    {"index", 0},
+                                    {"delta", json::object()}}});
+    } else {
+        if (parsed_content.empty()) {
+            choices = json::array({json{{"finish_reason", finish_reason},
                                         {"index", 0},
                                         {"message", json{{"content", content},
                                                          {"role", "assistant"}}}}});
+        } else {
+            std::vector<json> oai_format_tool_calls;
+            for (size_t i = 0; i < parsed_content.size(); ++i) {
+                const auto &pc = parsed_content[i];
+                // Use 'pc' and 'i' as needed
+                json tool_call;
+                tool_call["id"] = pc["id"];
+                tool_call["type"] = "function";
+
+                tool_call["function"] = json{
+                    {"name" , pc["name"]},
+                    {"arguments" , pc["kwargs"].dump()},
+                };
+                oai_format_tool_calls.push_back(tool_call);
+            }
+            choices = json::array({json{{"finish_reason", "tool_calls"},
+                                        {"index", 0},
+                                        {"message", json{{"tool_calls", oai_format_tool_calls},
+                                                         {"role", "assistant"}}}}});
+        }
+    }
 
     std::time_t t = std::time(0);
 
-    json res =
-        json{{"choices", choices},
-            {"created", t},
-            {"model",
-                json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
-            {"object", streaming ? "chat.completion.chunk" : "chat.completion"},
-            {"usage",
-                json{{"completion_tokens", num_tokens_predicted},
-                     {"prompt_tokens",     num_prompt_tokens},
-                     {"total_tokens",      num_tokens_predicted + num_prompt_tokens}}},
-            {"id", gen_chatcmplid()}};
+    json res = json {
+        {"choices", choices},
+        {"created", t},
+        {"model",
+            json_value(request, "model", std::string(DEFAULT_OAICOMPAT_MODEL))},
+        {"object", streaming ? "chat.completion.chunk" : "chat.completion"},
+        {"usage", json {
+            {"completion_tokens", num_tokens_predicted},
+            {"prompt_tokens",     num_prompt_tokens},
+            {"total_tokens",      num_tokens_predicted + num_prompt_tokens}
+        }},
+        {"id", gen_chatcmplid()}
+    };
+    printf("==============formatted_final_response_oaicompat================\n %s\n\n", res.dump().c_str());
 
     if (server_verbose) {
         res["__verbose"] = result;
