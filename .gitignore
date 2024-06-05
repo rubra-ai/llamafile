@@ -10,5 +10,6 @@
 
 /*.log
 *.DS_Store
+.vscode/
 *.llamafile
 *.gguf
