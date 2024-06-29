@@ -5,7 +5,7 @@
 #include "llama.cpp/llama.h"
 #include "llama.cpp/grammar-parser.h"
 #include "llama.cpp/llava/llava.h"
-#include "llama.cpp/stb_image.h"
+#include "stb/stb_image.h"
 #include "utils.h"
 #include "oai.h"
 #include "llamafile/micros.h"
@@ -2219,6 +2219,15 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
                 break;
             }
             sparams.hostname = argv[i];
+        }
+        else if (arg == "--temp")
+        {
+            if (++i >= argc)
+            {
+                invalid_param = true;
+                break;
+            }
+            // ignored
         }
         else if (arg == "--path")
         {

@@ -97,16 +97,40 @@ static std::string replaceAll(std::string str, const std::string& from, const st
     return str;
 }
 
+
+#ifdef __x86_64__
+static void cpuid(unsigned leaf, unsigned subleaf, unsigned *info) {
+    asm("movq\t%%rbx,%%rsi\n\t"
+        "cpuid\n\t"
+        "xchgq\t%%rbx,%%rsi"
+        : "=a"(info[0]), "=S"(info[1]), "=c"(info[2]), "=d"(info[3])
+        : "0"(leaf), "2"(subleaf));
+}
+#endif // __x86_64__
+
 static std::string get_cpu_info() { // [jart]
     std::string id;
 
+#ifdef __x86_64__
+    union { // [jart]
+        char str[64];
+        unsigned reg[16];
+    } u = {0};
+    cpuid(0x80000002, 0, u.reg + 0*4);
+    cpuid(0x80000003, 0, u.reg + 1*4);
+    cpuid(0x80000004, 0, u.reg + 2*4);
+    int len = strlen(u.str);
+    while (len > 0 && u.str[len - 1] == ' ')
+        u.str[--len] = 0;
+    id = u.str;
+#else
     if (IsLinux()) {
         FILE * f = fopen("/proc/cpuinfo", "r");
         if (f) {
             char buf[1024];
             while (fgets(buf, sizeof(buf), f)) {
-                if (strncmp(buf, "model name", 10) == 0 ||
-                    startswith(buf, "Model           :")) {
+                if (!strncmp(buf, "model name", 10) ||
+                    startswith(buf, "Model\t\t:")) { // e.g. raspi
                     char * p = strchr(buf, ':');
                     if (p) {
                         p++;
@@ -117,9 +141,6 @@ static std::string get_cpu_info() { // [jart]
                             p[strlen(p) - 1] = '\0';
                         }
                         id = p;
-                        id = replaceAll(id, " 96-Cores", "");
-                        id = replaceAll(id, "(TM)", "");
-                        id = replaceAll(id, "(R)", "");
                         break;
                     }
                 }
@@ -127,7 +148,6 @@ static std::string get_cpu_info() { // [jart]
             fclose(f);
         }
     }
-
     if (IsXnu()) {
         char cpu_name[128] = {0};
         size_t size = sizeof(cpu_name);
@@ -135,6 +155,10 @@ static std::string get_cpu_info() { // [jart]
             id = cpu_name;
         }
     }
+#endif
+    id = replaceAll(id, " 96-Cores", "");
+    id = replaceAll(id, "(TM)", "");
+    id = replaceAll(id, "(R)", "");
 
     std::string march;
 #ifdef __x86_64__
@@ -241,7 +265,7 @@ struct cmd_params {
 };
 
 static const cmd_params cmd_params_defaults = {
-    /* model         */ {"models/7B/ggml-model-q4_0.gguf"},
+    /* model         */ {}, // [jart] no default guessing
     /* n_prompt      */ {512},
     /* n_gen         */ {16},
     /* n_pg          */ {},
@@ -335,7 +359,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     for (int i = 1; i < argc; i++) {
         arg = argv[i];
         if (arg.compare(0, arg_prefix.size(), arg_prefix) == 0) {
-            std::replace(arg.begin(), arg.end(), '_', '-');
+            std::replace (arg.begin(), arg.end(), '_', '-');
         }
 
         if (arg == "-h" || arg == "--help") {
@@ -557,8 +581,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         }
     }
     if (invalid_param) {
-        fprintf(stderr, "error: invalid parameter for argument: %s\n", arg.c_str());
-        print_usage(argc, argv);
+        fprintf(stderr, "%s: invalid parameter for argument: %s\n", program_invocation_name, arg.c_str());
+        exit(1);
+    }
+    if (params.model.empty()) {
+        fprintf(stderr, "%s: missing operand\n", program_invocation_name, arg.c_str());
         exit(1);
     }
 

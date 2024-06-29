@@ -23,7 +23,6 @@
 #include <string>
 #include <vector>
 
-
 ////////////////////////////////////////////////////////////////////////////////
 //
 // ROLLUP acc.cu
@@ -159,13 +158,7 @@
 #define cudaHostRegisterReadOnly hipHostRegisterReadOnly
 #define cudaHostUnregister hipHostUnregister
 #define cudaLaunchHostFunc hipLaunchHostFunc
-#ifdef GGML_HIP_UMA
-#define cudaMalloc hipMallocManaged
-#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size)
-#else
-#define cudaMalloc hipMalloc
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
-#endif
 #define cudaMemcpy hipMemcpy
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
@@ -3614,6 +3607,8 @@ void ggml_cuda_op_dequantize_mul_mat_vec(
     GGML_UNUSED(src1_padded_row_size);
 }
 
+#ifndef GGML_MINIMIZE_CODE_SIZE
+
 ////////////////////////////////////////////////////////////////////////////////
 //
 // ROLLUP fattn.cu
@@ -5104,7 +5099,6 @@ void ggml_cuda_flash_attn_ext_tile_f32(ggml_backend_cuda_context & ctx, ggml_ten
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-
 template<int D, int ncols, int parallel_blocks> // D == head size
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 __launch_bounds__(D, 1)
@@ -5438,7 +5432,6 @@ void ggml_cuda_flash_attn_ext_vec_f16_no_mma(ggml_backend_cuda_context & ctx, gg
 //
 ////////////////////////////////////////////////////////////////////////////////
 
-
 template<int D, int ncols, int parallel_blocks> // D == head size
 #if !(defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__))
 __launch_bounds__(D, 1)
@@ -5714,6 +5707,8 @@ void ggml_cuda_flash_attn_ext_vec_f32(ggml_backend_cuda_context & ctx, ggml_tens
     constexpr int parallel_blocks = 1;
     launch_fattn_vec_f32_64_128<cols_per_block, parallel_blocks>(ctx, dst);
 }
+
+#endif // GGML_MINIMIZE_CODE_SIZE
 
 ////////////////////////////////////////////////////////////////////////////////
 //
@@ -10866,13 +10861,32 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+static inline cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
+#if defined(GGML_USE_HIPBLAS)
+    auto res = hipMalloc(ptr, size);
+    // if Not enough space on VRAM => try with UMA
+    if (res == hipErrorOutOfMemory) {
+        GGML_CUDA_LOG_INFO("  Device %d: can not alloc %d MB on VRAM try alloc on HMM\n", device, (uint32_t)(size / 1024 / 1024));
+        res = hipMallocManaged(ptr, size);
+        if (res == hipSuccess) {
+            // Config the memory for best speed (It's not supposed to fail)
+            CUDA_CHECK(hipMemAdvise(*ptr, size, hipMemAdviseSetCoarseGrain, device));
+            GGML_CUDA_LOG_INFO("    => success\n");
+        }
+    }
+    return res;
+#else
+    return cudaMalloc(ptr, size);
+#endif
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
 #ifdef __HIP_PLATFORM_AMD__
     // Workaround for a rocBLAS bug when using multiple graphics cards:
     // https://github.com/ROCmSoftwarePlatform/rocBLAS/issues/1346
 #ifndef GGML_USE_TINYBLAS
-    rocblas_initialize();
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // rocblas_initialize(); // already called
+    // CUDA_CHECK(cudaDeviceSynchronize());
 #endif
 #endif
 
@@ -11020,7 +11034,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
-        CUDA_CHECK(cudaMalloc((void **) &ptr, look_ahead_size));
+        CUDA_CHECK(ggml_cuda_device_malloc(&ptr, look_ahead_size, device));
         *actual_size = look_ahead_size;
         pool_size += look_ahead_size;
 #ifdef DEBUG_CUDA_MALLOC
@@ -11286,7 +11300,7 @@ GGML_CALL static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffe
     size = std::max(size, (size_t)1); // cudaMalloc returns null for size 0
 
     void * dev_ptr;
-    cudaError_t err = cudaMalloc(&dev_ptr, size);
+    cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
     if (err != cudaSuccess) {
         // clear the error
         cudaGetLastError();
@@ -11547,7 +11561,7 @@ GGML_CALL static void ggml_backend_cuda_split_buffer_init_tensor(ggml_backend_bu
         // currently, init_tensor cannot fail, it needs to be fixed in ggml-backend first
         ggml_cuda_set_device(id);
         char * buf;
-        CUDA_CHECK(cudaMalloc(&buf, size));
+        CUDA_CHECK(ggml_cuda_device_malloc((void**)&buf, size, id));
 
         // set padding to 0 to avoid possible NaN values
         if (size > original_size) {
@@ -13083,7 +13097,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_argsort(ctx, dst);
             break;
         case GGML_OP_FLASH_ATTN_EXT:
+#ifndef GGML_MINIMIZE_CODE_SIZE
             ggml_cuda_flash_attn_ext(ctx, dst);
+#endif
             break;
         default:
             return false;
@@ -13494,7 +13510,9 @@ GGML_CALL static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t
             GGML_ASSERT(stat == cudaSuccess);
         }
         // Launch graph
+        printf("cudaGraphLaunch begin\n");
         CUDA_CHECK(cudaGraphLaunch(cuda_ctx->cuda_graph->instance, cuda_ctx->stream()));
+        printf("cudaGraphLaunch done\n");
 #else
         graph_evaluated_or_captured = true;
 #endif // USE_CUDA_GRAPH
@@ -13634,7 +13652,9 @@ GGML_CALL static bool ggml_backend_cuda_supports_op(ggml_backend_t backend, cons
         case GGML_OP_LEAKY_RELU:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
-#if defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
+#if defined(GGML_MINIMIZE_CODE_SIZE)
+            return false;
+#elif defined(GGML_USE_HIPBLAS) && defined(__HIP_PLATFORM_AMD__)
             return op->src[0]->ne[0] == 64 || op->src[0]->ne[0] == 128;
 #else
             if (op->src[0]->ne[0] == 64 || op->src[0]->ne[0] == 128) {

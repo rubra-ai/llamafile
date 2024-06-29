@@ -61,7 +61,8 @@ __static_yoink("llama.cpp/ggml-backend-impl.h");
     /* "-DNDEBUG",  */ "-DGGML_BUILD=1", "-DGGML_SHARED=1", "-DGGML_MULTIPLATFORM", \
         "-DGGML_CUDA_DMMV_X=32", "-DK_QUANTS_PER_ITERATION=2", \
         "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128", "-DGGML_CUDA_MMV_Y=1", \
-        (FLAG_tinyblas ? "-DGGML_USE_TINYBLAS" : "-DGGML_USE_CUBLAS")
+        (FLAG_tinyblas ? "-DGGML_USE_TINYBLAS" : "-DGGML_USE_CUBLAS"), \
+        (FLAG_flash_attn ? "-DTEHFLASH" : "-DGGML_MINIMIZE_CODE_SIZE")
 
 #define NVCC_FLAGS \
     "-std=c++11", "-O3", "--shared", "--use_fast_math", "--forward-unknown-to-host-compiler", \
@@ -559,7 +560,15 @@ static bool compile_amd_windows(const char *clangxx, const char *dso, const char
         (char *)offload_arch,
         "-Wno-ignored-attributes",
         "-D_CRT_SECURE_NO_WARNINGS",
-        COMMON_FLAGS,
+        "-DGGML_BUILD=1",
+        "-DGGML_SHARED=1",
+        "-DGGML_MULTIPLATFORM",
+        "-DGGML_CUDA_DMMV_X=32",
+        "-DK_QUANTS_PER_ITERATION=2",
+        "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128",
+        "-DGGML_CUDA_MMV_Y=1",
+        "-DGGML_USE_TINYBLAS",
+        FLAG_flash_attn ? "-DTEHFLASH" : "-DGGML_MINIMIZE_CODE_SIZE",
         "-o",
         (char *)tmpdso,
         (char *)src,
@@ -571,10 +580,10 @@ static bool compile_amd_windows(const char *clangxx, const char *dso, const char
         "-amdgpu-early-inline-all=true",
         "-isystem",
         gc(xasprintf("%s/include", hip_path)),
-        BLAS_ONLY("-l"),
-        BLAS_ONLY(gc(xasprintf("%s/lib/hipblas.%s", hip_path, lib))),
-        BLAS_ONLY("-l"),
-        BLAS_ONLY(gc(xasprintf("%s/lib/rocblas.%s", hip_path, lib))),
+        /* BLAS_ONLY("-l"), */
+        /* BLAS_ONLY(gc(xasprintf("%s/lib/hipblas.%s", hip_path, lib))), */
+        /* BLAS_ONLY("-l"), */
+        /* BLAS_ONLY(gc(xasprintf("%s/lib/rocblas.%s", hip_path, lib))), */
         "-l",
         gc(xasprintf("%s/lib/amdhip64.%s", hip_path, lib)),
         "-lkernel32",
@@ -778,9 +787,9 @@ static bool import_cuda_impl(void) {
 
     char dso[PATH_MAX];
     char bindir[PATH_MAX];
-    const char *compiler_path;
+    const char *compiler_path = NULL;
     char compiler_path_buf[PATH_MAX];
-    const char *library_path;
+    const char *library_path = NULL;
     char library_path_buf[PATH_MAX];
 
     // Attempt to load AMD GPU support.
@@ -791,15 +800,21 @@ static bool import_cuda_impl(void) {
 
         // Get some essential paths.
         // ROCm SDK puts BLAS DLLs in same folder as clang++
-        if (get_rocm_bin_path(compiler_path_buf, "amdclang++") ||
-            get_rocm_bin_path(compiler_path_buf, "clang++")) {
-            strcpy(library_path_buf, compiler_path_buf);
-            dirname(library_path_buf);
-            compiler_path = compiler_path_buf;
-            library_path = library_path_buf;
+        if (!IsWindows()) {
+            if (get_rocm_bin_path(compiler_path_buf, "hipcc")) {
+                strcpy(library_path_buf, compiler_path_buf);
+                dirname(library_path_buf);
+                compiler_path = compiler_path_buf;
+                library_path = library_path_buf;
+            }
         } else {
-            compiler_path = 0;
-            library_path = 0;
+            if (get_rocm_bin_path(compiler_path_buf, "amdclang++") ||
+                get_rocm_bin_path(compiler_path_buf, "clang++")) {
+                strcpy(library_path_buf, compiler_path_buf);
+                dirname(library_path_buf);
+                compiler_path = compiler_path_buf;
+                library_path = library_path_buf;
+            }
         }
 
         // Get path of GGML DSO for AMD.
