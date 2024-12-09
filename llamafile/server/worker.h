@@ -17,25 +17,35 @@
 
 #pragma once
 #include "client.h"
-#include "server.h"
 #include <cosmo.h>
 #include <pthread.h>
 
-#define WORKER(e) DLL_CONTAINER(Worker, elem, e)
+#define WORKER(e) DLL_CONTAINER(Worker, elem_, e)
+
+struct llama_model;
+
+namespace lf {
+namespace server {
+
+struct Server;
 
 struct Worker
 {
-    Server* server;
-    Dll elem;
-    pthread_t th = 0;
-    bool working = false;
-    Client client;
+    Server* server_;
+    Dll elem_;
+    pthread_t th_ = 0;
+    bool working_ = false;
+    Client client_;
 
-    Worker(Server*);
+    explicit Worker(Server*, llama_model*);
     void run();
     void begin();
-    void handle(void);
+    void handle();
     void end();
+    void deprioritize();
     void retire();
     void kill();
 };
+
+} // namespace server
+} // namespace lf

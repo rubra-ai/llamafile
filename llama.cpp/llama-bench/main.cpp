@@ -15,8 +15,7 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-#include <tool/args/args.h>
-#include <sys/auxv.h>
+#include <cosmo.h>
 #include <stdatomic.h>
 #include <third_party/nsync/futex.internal.h>
 
@@ -111,8 +110,6 @@ static void launch_sigint_thread(void) {
     sigfillset(&block_every_signal);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 65536);
-    pthread_attr_setguardsize(&attr, getauxval(AT_PAGESZ));
     pthread_attr_setsigmask_np(&attr, &block_every_signal);
     pthread_create(&th, &attr, safe_sigint_handler, 0);
     pthread_attr_destroy(&attr);
@@ -153,7 +150,7 @@ int main(int argc, char ** argv) {
 
     llamafile_check_cpu();
     ShowCrashReports();
-    LoadZipArgs(&argc, &argv);
+    argc = cosmo_args("/zip/.args", &argv);
     launch_sigint_thread();
 
     if (!llamafile_has(argv, "--cli") &&

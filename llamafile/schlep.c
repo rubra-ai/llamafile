@@ -22,7 +22,6 @@
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
-#include <sys/auxv.h>
 #include <unistd.h>
 
 #define FPS 24
@@ -72,6 +71,10 @@ static void FormatPercent(char sbuf[static 8], double x) {
  */
 void llamafile_schlep(const void *data, size_t size) {
 
+    // avoid warmup
+    if (!FLAG_warmup)
+        return;
+
     // don't bother if logging is disabled
     if (FLAG_log_disable)
         return;
@@ -87,13 +90,9 @@ void llamafile_schlep(const void *data, size_t size) {
     // launch threads
     errno_t err;
     atomic_long faults = 0;
+    long pagesz = getpagesize();
     long stride = size / THREADS;
-    long pagesz = getauxval(AT_PAGESZ);
     long pages = (stride + pagesz - 1) / pagesz * THREADS;
-    pthread_attr_t attr;
-    pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 65536);
-    pthread_attr_setguardsize(&attr, pagesz);
     struct PageFaulter pf[THREADS];
     for (int i = 0; i < THREADS; ++i) {
         pf[i].data = data;
@@ -101,14 +100,13 @@ void llamafile_schlep(const void *data, size_t size) {
         pf[i].faults = &faults;
         pf[i].left = stride * i;
         pf[i].right = stride * (i + 1);
-        err = pthread_create(&pf[i].th, &attr, PageFaulter, pf + i);
+        err = pthread_create(&pf[i].th, 0, PageFaulter, pf + i);
         if (err) {
             errno = err;
             perror("pthread_create");
             exit(1);
         }
     }
-    pthread_attr_destroy(&attr);
 
     // report progress
     for (;;) {

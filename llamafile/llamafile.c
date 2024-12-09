@@ -212,7 +212,7 @@ static struct llamafile *llamafile_open_zip(const char *prog, const char *fname,
                 file->fname);
 
     // map the file into memory
-    long pagesz = sysconf(_SC_PAGESIZE);
+    long pagesz = sysconf(_SC_GRANSIZE);
     off_t mapoff = off & -pagesz;
     long skew = off - mapoff;
     file->mapsize = skew + file->size;
@@ -294,7 +294,7 @@ struct llamafile *llamafile_open_gguf(const char *fname, const char *mode) {
         errno = EIO;
         return 0;
     }
-    if (ZIP_READ32(buf) == ZIP_READ32("GGUF")) {
+    if (ZIP_READ32(buf) == ZIP_READ32("GGUF") || ZIP_READ32(buf) == ZIP_READ32("ggml")) {
         errno = EINVAL;
         return file;
     }
@@ -312,6 +312,16 @@ size_t llamafile_size(struct llamafile *file) {
     return file->size;
 }
 
+size_t llamafile_position(struct llamafile *file) {
+    return file->position;
+}
+
+bool llamafile_eof(struct llamafile *file) {
+    if (file->fp)
+        return feof(file->fp);
+    return file->position >= file->size;
+}
+
 void *llamafile_content(struct llamafile *file) {
     return file->content;
 }
@@ -320,7 +330,7 @@ size_t llamafile_tell(struct llamafile *file) {
     if (!file->fp)
         return file->position;
     long ret = ftell(file->fp);
-    unassert(ret != -1); // shouldn't fail because we seeked earlier
+    npassert(ret != -1); // shouldn't fail because we seeked earlier
     return (size_t)ret;
 }
 

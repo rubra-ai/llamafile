@@ -8,8 +8,6 @@ LLAMA_CPP_LLAVA_HDRS = $(filter %.h,$(LLAMA_CPP_LLAVA_FILES))
 LLAMA_CPP_LLAVA_SRCS = $(filter %.cpp,$(LLAMA_CPP_LLAVA_FILES))
 LLAMA_CPP_LLAVA_OBJS = $(LLAMA_CPP_LLAVA_SRCS:%.cpp=o/$(MODE)/%.o)
 
-.PHONY: tool/args/args.h
-
 o/$(MODE)/llama.cpp/llava/llava.a:					\
 		$(LLAMA_CPP_LLAVA_OBJS)
 
@@ -18,13 +16,7 @@ o/$(MODE)/llama.cpp/llava/llava-quantize:				\
 		o/$(MODE)/llama.cpp/llava/llava-quantize.1.asc.zip.o	\
 		o/$(MODE)/llama.cpp/llava/llava.a			\
 		o/$(MODE)/llama.cpp/llama.cpp.a				\
-		o/$(MODE)/stb/stb.a
-
-o/$(MODE)/llama.cpp/llava/clip.o					\
-o/$(MODE)/llama.cpp/llava/llava.o					\
-o/$(MODE)/llama.cpp/llava/llava-cli.o					\
-o/$(MODE)/llama.cpp/llava/llava-quantize.o: private			\
-		CCFLAGS += -Os
+		o/$(MODE)/third_party/stb/stb.a
 
 $(LLAMA_CPP_LLAVA_OBJS): llama.cpp/llava/BUILD.mk
 

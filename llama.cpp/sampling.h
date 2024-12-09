@@ -4,7 +4,7 @@
 
 #include "grammar-parser.h"
 
-#include <random>
+#include <__random/mersenne_twister_engine.h> // [jart]
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -115,6 +115,11 @@ std::string llama_sampling_print(const llama_sampling_params & params);
 
 // Print sampling order into a string
 std::string llama_sampling_order_print(const llama_sampling_params & params);
+
+std::string llama_sampling_type_to_str(llama_sampler_type sampler_type);
+
+std::vector<llama_sampler_type> llama_sampling_types_from_names(const std::vector<std::string> & names, bool allow_alt_names);
+std::vector<llama_sampler_type> llama_sampling_types_from_chars(const std::string & names_string);
 
 // this is a common sampling function used across the examples for convenience
 // it can serve as a starting point for implementing your own sampling function

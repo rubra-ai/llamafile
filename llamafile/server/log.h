@@ -18,13 +18,16 @@
 #pragma once
 #include <libc/intrin/kprintf.h>
 
-#define LOG(FMT, ...) \
+#define SLOG(FMT, ...) \
     kprintf("%s %s:%d %s " FMT "\n", \
             get_log_timestamp(), \
             __FILE__, \
             __LINE__, \
             get_thread_name(), \
             ##__VA_ARGS__)
+
+namespace lf {
+namespace server {
 
 const char*
 get_thread_name(void);
@@ -34,3 +37,6 @@ get_log_timestamp(void);
 
 void
 set_thread_name(const char*);
+
+} // namespace server
+} // namespace lf

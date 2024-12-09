@@ -14,12 +14,10 @@ o/$(MODE)/llama.cpp/main/main:					\
 		o/$(MODE)/llama.cpp/server/server.a		\
 		o/$(MODE)/llama.cpp/llava/llava.a		\
 		o/$(MODE)/llama.cpp/llama.cpp.a			\
-		o/$(MODE)/stb/stb.a				\
+		o/$(MODE)/llamafile/highlight/highlight.a	\
+		o/$(MODE)/third_party/stb/stb.a			\
 		o/$(MODE)/llama.cpp/main/main.1.asc.zip.o	\
 		$(LLAMA_CPP_SERVER_ASSETS:%=o/$(MODE)/%.zip.o)
-
-o/$(MODE)/llama.cpp/main/main.o: private			\
-		CCFLAGS += -Os
 
 $(LLAMA_CPP_MAIN_OBJS): llama.cpp/main/BUILD.mk
 

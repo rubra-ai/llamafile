@@ -5,7 +5,7 @@
 #include "llama.cpp/llama.h"
 #include "llama.cpp/grammar-parser.h"
 #include "llama.cpp/llava/llava.h"
-#include "stb/stb_image.h"
+#include "third_party/stb/stb_image.h"
 #include "utils.h"
 #include "oai.h"
 #include "llamafile/micros.h"
@@ -20,15 +20,18 @@
 
 #include <cstddef>
 #include <thread>
-#include <chrono>
+// #include <chrono> // [jart]
 #include <condition_variable>
 #include <atomic>
 #include <signal.h>
-#include <libc/calls/pledge.h>
-#include <tool/args/args.h>
+#include <cosmo.h>
 #include <libc/dce.h>
 
 double g_prompt_per_second_jart;
+
+bool g_server_background_mode;
+llama_model *g_server_force_llama_model;
+void (*g_server_on_listening)(const char *host, int port);
 
 using json = nlohmann::json;
 
@@ -44,6 +47,7 @@ struct server_params
     bool nobrowser = false;
     bool slots_endpoint = true;
     bool metrics_endpoint = false;
+    std::string url_prefix = "";
 };
 
 bool server_verbose = false;
@@ -444,7 +448,16 @@ struct llama_server_context
             }
         }
 
-        std::tie(model, ctx) = llama_init_from_gpt_params(params);
+        if (!g_server_force_llama_model) {
+            llama_init_result llama_init = llama_init_from_gpt_params(params);
+            model = llama_init.model;
+            ctx = llama_init.context;
+        } else {
+            llama_context_params ctx_params = llama_context_params_from_gpt_params(params);
+            model = g_server_force_llama_model;
+            ctx = llama_new_context_with_model(model, ctx_params);
+        }
+
         if (model == nullptr)
         {
             LOG_ERROR("unable to load model", {{"model", params.model}});
@@ -786,7 +799,7 @@ struct llama_server_context
                     sampler_names.emplace_back(sampler_name);
                 }
             }
-            slot->sparams.samplers_sequence = sampler_types_from_names(sampler_names, false);
+            slot->sparams.samplers_sequence = llama_sampling_types_from_names(sampler_names, false);
         }
         else
         {
@@ -1155,7 +1168,7 @@ struct llama_server_context
         std::vector<std::string> samplers_sequence;
         for (const auto &sampler_type : slot.sparams.samplers_sequence)
         {
-            samplers_sequence.emplace_back(sampler_type_to_name_string(sampler_type));
+            samplers_sequence.emplace_back(llama_sampling_type_to_str(sampler_type));
         }
 
         return json {
@@ -2139,7 +2152,7 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
     printf("                              - distribute: spread execution evenly over all nodes\n");
     printf("                              - isolate: only spawn threads on CPUs on the node that execution started on\n");
     printf("                              - numactl: use the CPU map provided my numactl\n");
-    if (llama_supports_gpu_offload()) {
+    // if (llama_supports_gpu_offload()) { // [jart] prevent init error
         printf("  -ngl N, --n-gpu-layers N\n");
         printf("                            number of layers to store in VRAM\n");
         printf("  -sm SPLIT_MODE, --split-mode SPLIT_MODE\n");
@@ -2151,16 +2164,15 @@ static void server_print_usage(const char *argv0, const gpt_params &params,
         printf("                            fraction of the model to offload to each GPU, comma-separated list of proportions, e.g. 3,1\n");
         printf("  -mg i, --main-gpu i       the GPU to use for the model (with split-mode = none),\n");
         printf("                            or for intermediate results and KV (with split-mode = row)\n");
-    }
+    // } // [jart] prevent init error
     printf("  -m FNAME, --model FNAME\n");
     printf("                            model path (default: %s)\n", params.model.c_str());
     printf("  -a ALIAS, --alias ALIAS\n");
     printf("                            set an alias for the model, will be added as `model` field in completion response\n");
-    printf("  --lora FNAME              apply LoRA adapter (implies --no-mmap)\n");
-    printf("  --lora-base FNAME         optional model to use as a base for the layers modified by the LoRA adapter\n");
     printf("  --host                    ip address to listen (default  (default: %s)\n", sparams.hostname.c_str());
     printf("  --port PORT               port to listen (default  (default: %d)\n", sparams.port);
     printf("  --path PUBLIC_PATH        path from which to serve static files (default %s)\n", sparams.public_path.c_str());
+    printf("  --url-prefix PREFIX       Specify a URL prefix (subdirectory) under which the API will be served, e.g. /llamafile (default: '/')\n");
     printf("  --api-key API_KEY         optional api key to enhance server security. If set, requests must include this key for access.\n");
     printf("  --api-key-file FNAME      path to file containing api keys delimited by new lines. If set, requests must include one of the keys for access.\n");
     printf("  -to N, --timeout N        server read/write timeout in seconds (default: %d)\n", sparams.read_timeout);
@@ -2229,6 +2241,15 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
             }
             // ignored
         }
+        else if (arg == "--repeat-penalty")
+        {
+            if (++i >= argc)
+            {
+                invalid_param = true;
+                break;
+            }
+            // ignored
+        }
         else if (arg == "--path")
         {
             if (++i >= argc)
@@ -2237,6 +2258,31 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
                 break;
             }
             sparams.public_path = argv[i];
+        }
+        else if (arg == "--url-prefix")
+        {
+            if (++i >= argc)
+            {
+                invalid_param = true;
+                break;
+            }
+            sparams.url_prefix = argv[i];
+            // 1. Consolidate consecutive slashes
+            while (sparams.url_prefix.find("//") != std::string::npos) {
+                sparams.url_prefix.replace(sparams.url_prefix.find("//"), 2, "/");
+            }
+            // 2 Ensure single slash at start
+            if (sparams.url_prefix.empty() || sparams.url_prefix[0] != '/') {
+               sparams.url_prefix = "/" + sparams.url_prefix;
+            }
+            // 3. Remove trailing slash if present
+            if (!sparams.url_prefix.empty() && sparams.url_prefix.back() == '/') {
+                sparams.url_prefix.pop_back();
+            }
+            // 4. If only a single slash remains, convert to empty string
+            if (sparams.url_prefix == "/") {
+                sparams.url_prefix = "";
+            }
         }
         else if (arg == "--api-key")
         {
@@ -2277,6 +2323,10 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
             }
             sparams.read_timeout = std::stoi(argv[i]);
             sparams.write_timeout = std::stoi(argv[i]);
+        }
+        else if (arg == "-fa" || arg == "--flash-attn") {
+            params.flash_attn = true;
+            FLAG_flash_attn = true;
         }
         else if (arg == "-m" || arg == "--model")
         {
@@ -2427,13 +2477,13 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
                 invalid_param = true;
                 break;
             }
-            if (llama_supports_gpu_offload()) {
+            // if (llama_supports_gpu_offload()) { // [jart] prevent init error
                 params.n_gpu_layers = std::stoi(argv[i]);
-            } else {
-                LOG_WARNING("Not compiled with GPU offload support, --n-gpu-layers option will be ignored. "
-                        "See main README.md for information on enabling GPU BLAS support",
-                        {{"n_gpu_layers", params.n_gpu_layers}});
-            }
+            // } else {
+            //     LOG_WARNING("Not compiled with GPU offload support, --n-gpu-layers option will be ignored. "
+            //             "See main README.md for information on enabling GPU BLAS support",
+            //             {{"n_gpu_layers", params.n_gpu_layers}});
+            // }
         }
         else if (arg == "--split-mode" || arg == "-sm")
         {
@@ -2495,41 +2545,6 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
             }
             params.main_gpu = std::stoi(argv[i]);
         }
-        else if (arg == "--lora")
-        {
-            if (++i >= argc)
-            {
-                invalid_param = true;
-                break;
-            }
-            params.lora_adapter.emplace_back(argv[i], 1.0f);
-            params.use_mmap = false;
-        }
-        else if (arg == "--lora-scaled")
-        {
-            if (++i >= argc)
-            {
-                invalid_param = true;
-                break;
-            }
-            const char * lora_adapter = argv[i];
-            if (++i >= argc)
-            {
-                invalid_param = true;
-                break;
-            }
-            params.lora_adapter.emplace_back(lora_adapter, std::stof(argv[i]));
-            params.use_mmap = false;
-        }
-        else if (arg == "--lora-base")
-        {
-            if (++i >= argc)
-            {
-                invalid_param = true;
-                break;
-            }
-            params.lora_base = argv[i];
-        }
         else if (arg == "-v" || arg == "--verbose")
         {
 #if SERVER_VERBOSE != 1
@@ -2549,13 +2564,43 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
         else if (arg == "--server")
         {
         }
+        else if (arg == "--chat")
+        {
+        }
+        else if (arg == "--cli")
+        {
+        }
+        else if (arg == "--embedding")
+        {
+        }
         else if (arg == "--fast")
         {
-            FLAG_precise = false;
+            FLAG_fast = true;
+        }
+        else if (arg == "--iq")
+        {
+            FLAG_iq = true;
         }
         else if (arg == "--precise")
         {
             FLAG_precise = true;
+        }
+        else if (arg == "--ascii")
+        {
+            FLAG_ascii = true;
+        }
+        else if (arg == "--nologo")
+        {
+            FLAG_nologo = true;
+        }
+        else if (arg == "--no-display-prompt" || //
+                 arg == "--silent-prompt")
+        {
+            FLAG_no_display_prompt = true;
+        }
+        else if (arg == "--display-prompt")
+        {
+            FLAG_no_display_prompt = false;
         }
         else if (arg == "--trap")
         {
@@ -2593,6 +2638,10 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
         {
             params.use_mmap = false;
         }
+        else if (arg == "--no-warmup")
+        {
+            params.warmup = false;
+        }
         else if (arg == "--numa") {
             if (++i >= argc) {
                 invalid_param = true;
@@ -2604,10 +2653,6 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
                 else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
                 else { invalid_param = true; break; }
             }
-        }
-        else if (arg == "--embedding")
-        {
-            params.embedding = true;
         }
         else if (arg == "-cb" || arg == "--cont-batching")
         {
@@ -2713,23 +2758,23 @@ static void server_params_parse(int argc, char **argv, server_params &sparams,
                 break;
             }
             sparams.chat_template = argv[i];
-        } else if (arg == "--override-kv") {
-            if (++i >= argc) {
-                invalid_param = true;
-                break;
-            }
-            if (!parse_kv_override(argv[i], params.kv_overrides)) {
-                fprintf(stderr, "error: Invalid type for KV override: %s\n", argv[i]);
-                invalid_param = true;
-                break;
-            }
         } else {
             fprintf(stderr, "error: unknown argument: %s\n", arg.c_str());
             exit(1);
         }
     }
 
-    params.embedding = true;  // [jart] #243 always enable embedding mode
+    FLAGS_READY = true;
+
+#if 0
+    // [jart] setting `embeddings = true` on the clip model causes a
+    //        llama_get_logits_ith() fail crash due to how this param
+    //        due to `const bool has_logits = !cparams.embeddings;` from
+    //        llama.cpp interacting strangely with this parameter.
+    if (params.mmproj.empty())
+        params.embedding = true;  // [jart] #243 always enable embedding mode
+#endif
+
     params.n_gpu_layers = llamafile_gpu_layers(params.n_gpu_layers);
 
     if (!params.kv_overrides.empty()) {
@@ -2886,7 +2931,7 @@ int server_cli(int argc, char **argv)
         res.set_header("Access-Control-Allow-Headers", "*");
     });
 
-    svr.Get("/health", [&](const httplib::Request& req, httplib::Response& res) {
+    svr.Get(sparams.url_prefix + "/health", [&](const httplib::Request& req, httplib::Response& res) {
         server_state current_state = state.load();
         switch(current_state) {
             case SERVER_STATE_READY: {
@@ -2936,7 +2981,7 @@ int server_cli(int argc, char **argv)
     });
 
     if (sparams.slots_endpoint) {
-        svr.Get("/slots", [&](const httplib::Request&, httplib::Response& res) {
+        svr.Get(sparams.url_prefix + "/slots", [&](const httplib::Request&, httplib::Response& res) {
             // request slots data using task queue
             task_server task;
             task.id = llama.queue_tasks.get_new_id();
@@ -2956,7 +3001,7 @@ int server_cli(int argc, char **argv)
     }
 
     if (sparams.metrics_endpoint) {
-        svr.Get("/metrics", [&](const httplib::Request&, httplib::Response& res) {
+        svr.Get(sparams.url_prefix + "/metrics", [&](const httplib::Request&, httplib::Response& res) {
             // request slots data using task queue
             task_server task;
             task.id = llama.queue_tasks.get_new_id();
@@ -3102,14 +3147,14 @@ int server_cli(int argc, char **argv)
     }
 
     // Set the base directory for serving static files
-    svr.set_base_dir(sparams.public_path);
+    svr.set_base_dir(sparams.public_path, sparams.url_prefix);
 
     // to make it ctrl+clickable:
     const char *connect_host;
     if (sparams.hostname != "0.0.0.0") {
         connect_host = sparams.hostname.c_str();
-        LOG_TEE("\nllama server listening at http://%s:%d\n\n",
-                sparams.hostname.c_str(), sparams.port);
+        LOG_TEE("\nllama server listening at http://%s:%d%s\n\n",
+                sparams.hostname.c_str(), sparams.port, sparams.url_prefix.c_str());
     } else {
         struct ifaddrs *ifaddrs;
         connect_host = "127.0.0.1";
@@ -3118,23 +3163,25 @@ int server_cli(int argc, char **argv)
             for (struct ifaddrs *ifa = ifaddrs; ifa; ifa = ifa->ifa_next) {
                 char buf[128];
                 if (!(ifa->ifa_flags & IFF_UP)) continue;
-                LOG_TEE("llama server listening at http://%s%s%s:%d\n",
+                LOG_TEE("llama server listening at http://%s%s%s:%d%s\n",
                         ifa->ifa_addr->sa_family == AF_INET6 ? "[" : "",
                         sockaddr2str(ifa->ifa_addr, buf, sizeof(buf)),
                         ifa->ifa_addr->sa_family == AF_INET6 ? "]" : "",
-                        sparams.port);
+                        sparams.port,
+                        sparams.url_prefix.c_str());
             }
             LOG_TEE("\n");
         } else {
             perror("getifaddrs");
-            LOG_TEE("\nllama server listening at http://%s:%d\n\n",
-                    sparams.hostname.c_str(), sparams.port);
+            LOG_TEE("\nllama server listening at http://%s:%d%s\n\n",
+                    sparams.hostname.c_str(), sparams.port, sparams.url_prefix.c_str());
         }
     }
 
     std::unordered_map<std::string, std::string> log_data;
     log_data["hostname"] = sparams.hostname;
     log_data["port"] = std::to_string(sparams.port);
+    log_data["url_prefix"] = sparams.url_prefix;
 
     if (sparams.api_keys.size() == 1) {
         log_data["api_key"] = "api_key: ****" + sparams.api_keys[0].substr(sparams.api_keys[0].length() - 4);
@@ -3143,13 +3190,26 @@ int server_cli(int argc, char **argv)
     }
 
     // launch browser tab
-    if (!sparams.nobrowser) {
-        char url[128];
-        snprintf(url, sizeof(url), "http://%s:%d/", connect_host, sparams.port);
+    if (!sparams.nobrowser && !g_server_background_mode) {
+        const size_t max_url_size = 2048;  // commonly accepted maximum URL length
+        char url[max_url_size];
+        int written = snprintf(url, sizeof(url), "http://%s:%d%s/", 
+                            connect_host, sparams.port, sparams.url_prefix.c_str());
+        if (written < 0 || written >= (int)sizeof(url)) {
+            LOG_ERROR("URL truncation occurred", {
+                {"connect_host", connect_host},
+                {"port", sparams.port},
+                {"url_prefix", sparams.url_prefix},
+            });
+            return 1;
+        }
         llamafile_launch_browser(url);
     }
+    if (g_server_on_listening) {
+        g_server_on_listening(connect_host, sparams.port);
+    }
 
-    if (!FLAG_unsecure) {
+    if (!FLAG_unsecure && !g_server_background_mode) {
         if (IsXnu()) {
             // Cosmopolitan libc explicitly does not support cosmo_dlopen on x64
             // macOS and mac_sandbox_init depends on cosmo_dlopen. We'll attempt
@@ -3250,7 +3310,7 @@ int server_cli(int argc, char **argv)
         return false;
     };
 
-    svr.Get("/props", [&llama](const httplib::Request & req, httplib::Response &res)
+    svr.Get(sparams.url_prefix + "/props", [&llama](const httplib::Request & req, httplib::Response &res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 json data = {
@@ -3262,7 +3322,7 @@ int server_cli(int argc, char **argv)
                 res.set_content(data.dump(), "application/json; charset=utf-8");
             });
 
-    svr.Post("/completion", [&llama, &validate_api_key](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/completion", [&llama, &validate_api_key](const httplib::Request &req, httplib::Response &res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 if (!validate_api_key(req, res)) {
@@ -3339,7 +3399,7 @@ int server_cli(int argc, char **argv)
                 }
             });
 
-    svr.Get("/v1/models", [&params](const httplib::Request& req, httplib::Response& res)
+    svr.Get(sparams.url_prefix + "/v1/models", [&params](const httplib::Request& req, httplib::Response& res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 std::time_t t = std::time(0);
@@ -3361,7 +3421,7 @@ int server_cli(int argc, char **argv)
 
 
     // TODO: add mount point without "/v1" prefix -- how?
-    svr.Post("/v1/chat/completions", [&llama, &validate_api_key, &sparams](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/v1/chat/completions", [&llama, &validate_api_key, &sparams](const httplib::Request &req, httplib::Response &res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 if (!validate_api_key(req, res)) {
@@ -3441,7 +3501,7 @@ int server_cli(int argc, char **argv)
                 }
             });
 
-    svr.Post("/infill", [&llama, &validate_api_key](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/infill", [&llama, &validate_api_key](const httplib::Request &req, httplib::Response &res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 if (!validate_api_key(req, res)) {
@@ -3511,7 +3571,7 @@ int server_cli(int argc, char **argv)
     svr.Options(R"(/.*)", [](const httplib::Request &, httplib::Response &res)
                 { return res.set_content("", "application/json; charset=utf-8"); });
 
-    svr.Post("/tokenize", [&llama](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/tokenize", [&llama](const httplib::Request &req, httplib::Response &res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 const json body = json::parse(req.body);
@@ -3524,7 +3584,7 @@ int server_cli(int argc, char **argv)
                 return res.set_content(data.dump(), "application/json; charset=utf-8");
             });
 
-    svr.Post("/detokenize", [&llama](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/detokenize", [&llama](const httplib::Request &req, httplib::Response &res)
             {
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 const json body = json::parse(req.body);
@@ -3539,8 +3599,25 @@ int server_cli(int argc, char **argv)
                 return res.set_content(data.dump(), "application/json; charset=utf-8");
             });
 
-    svr.Post("/embedding", [&llama](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/embedding", [&llama](const httplib::Request &req, httplib::Response &res)
             {
+
+                // TODO(jart): something llama.cpp did upstream causes
+                //             logits to no longer be saved when we
+                //             enable embedding mode. let's use this as
+                //             an opportunity to nudge people into using
+                //             the newer better server, which is now
+                //             production worthy and recommended for
+                //             /embedding serving. it's compatible with
+                //             the existing http api.
+                if (1) {
+                    fprintf(stderr, "warning: the --embedding endpoint is no longer supported in the the standard llamafile --server. "
+                            "please use our new llamafiler command, which gives you a 4x faster embedding server. this is our new "
+                            "server for llamafile that, once feature complete, will replace this one entirely.\n");
+                    res.status = 503;
+                    return res.set_content("Service Unavailable", "text/plain; charset=utf-8");
+                }
+
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 const json body = json::parse(req.body);
                 json prompt;
@@ -3575,8 +3652,25 @@ int server_cli(int argc, char **argv)
                 return res.set_content(result.result_json.dump(), "application/json; charset=utf-8");
             });
 
-    svr.Post("/v1/embeddings", [&llama](const httplib::Request &req, httplib::Response &res)
+    svr.Post(sparams.url_prefix + "/v1/embeddings", [&llama](const httplib::Request &req, httplib::Response &res)
             {
+
+                // TODO(jart): something llama.cpp did upstream causes
+                //             logits to no longer be saved when we
+                //             enable embedding mode. let's use this as
+                //             an opportunity to nudge people into using
+                //             the newer better server, which is now
+                //             production worthy and recommended for
+                //             /embedding serving. it's compatible with
+                //             the existing http api.
+                if (1) {
+                    fprintf(stderr, "warning: the --embedding endpoint is no longer supported in the the standard llamafile --server. "
+                            "please use our new llamafiler command, which gives you a 4x faster embedding server. this is our new "
+                            "server for llamafile that, once feature complete, will replace this one entirely.\n");
+                    res.status = 503;
+                    return res.set_content("Service Unavailable", "text/plain; charset=utf-8");
+                }
+
                 res.set_header("Access-Control-Allow-Origin", req.get_header_value("Origin"));
                 const json body = json::parse(req.body);
 
@@ -3665,6 +3759,7 @@ int server_cli(int argc, char **argv)
         llama.queue_tasks.terminate();
     };
 
+    if (!g_server_background_mode) {
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
     struct sigaction sigint_action;
     sigint_action.sa_handler = signal_handler;
@@ -3677,6 +3772,8 @@ int server_cli(int argc, char **argv)
     };
     SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
+    }
+
     llama.queue_tasks.start_loop();
     svr.stop();
     t.join();

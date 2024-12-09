@@ -23,6 +23,7 @@
 #include "llamafile/x.h"
 #include <assert.h>
 #include <cosmo.h>
+#include <ctype.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <libgen.h>
@@ -50,6 +51,11 @@ __static_yoink("llama.cpp/ggml-common.h");
 __static_yoink("llama.cpp/ggml-backend.h");
 __static_yoink("llama.cpp/ggml-backend-impl.h");
 
+// yoink the fastest zlib deflate impl from cosmo libc
+__static_yoink("_Cz_inflateInit2");
+__static_yoink("_Cz_inflate");
+__static_yoink("_Cz_inflateEnd");
+
 #define THESTRING(x) #x
 #define STRINGIFY(x) THESTRING(x)
 #define ARMS_ONLY(x) (!IsAarch64() ? "-DIGNORE" STRINGIFY(__COUNTER__) : x)
@@ -58,15 +64,16 @@ __static_yoink("llama.cpp/ggml-backend-impl.h");
 #define NVCC_LIBS BLAS_ONLY("-lcublas"), "-lcuda"
 
 #define COMMON_FLAGS \
-    /* "-DNDEBUG",  */ "-DGGML_BUILD=1", "-DGGML_SHARED=1", "-DGGML_MULTIPLATFORM", \
+    "-DNDEBUG", "-DGGML_BUILD=1", "-DGGML_SHARED=1", "-DGGML_MULTIPLATFORM", \
         "-DGGML_CUDA_DMMV_X=32", "-DK_QUANTS_PER_ITERATION=2", \
         "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128", "-DGGML_CUDA_MMV_Y=1", \
         (FLAG_tinyblas ? "-DGGML_USE_TINYBLAS" : "-DGGML_USE_CUBLAS"), \
-        (FLAG_flash_attn ? "-DTEHFLASH" : "-DGGML_MINIMIZE_CODE_SIZE")
+        (FLAG_iq || FLAG_flash_attn ? "-DTEHFLASH" : "-DGGML_MINIMIZE_CODE_SIZE")
 
 #define NVCC_FLAGS \
-    "-std=c++11", "-O3", "--shared", "--use_fast_math", "--forward-unknown-to-host-compiler", \
-        "--compiler-options", \
+    (!IsWindows() ? "-std=c++11" : "-DIGNORE123"), "-O3", "--shared", "--use_fast_math", \
+        "-Xcudafe", "--diag_suppress=177", "-Xcudafe", "--diag_suppress=940", "-Xcudafe", \
+        "--diag_suppress=1305", "--forward-unknown-to-host-compiler", "--compiler-options", \
         (!IsWindows() \
              ? (!IsAarch64() \
                     ? "-fPIC -O3 -march=native -mtune=native -std=c++11 -Wno-unused-function " \
@@ -94,8 +101,6 @@ static const struct Source {
     {"/zip/llama.cpp/ggml-cuda.cu", "ggml-cuda.cu"}, // must come last
 };
 
-GGML_CALL int ggml_backend_cuda_reg_devices(void);
-
 static struct Cuda {
     bool supported;
     bool has_amd_gpu;
@@ -110,6 +115,7 @@ static struct Cuda {
     typeof(ggml_backend_cuda_get_device_count) *GGML_CALL get_device_count;
     typeof(ggml_backend_cuda_unregister_host_buffer) *GGML_CALL unreg_host_buf;
     typeof(ggml_backend_cuda_register_host_buffer) *GGML_CALL register_host_buffer;
+    typeof(ggml_backend_cuda_get_device_description) *GGML_CALL get_description;
 } ggml_cuda;
 
 static const char *Dlerror(void) {
@@ -568,7 +574,7 @@ static bool compile_amd_windows(const char *clangxx, const char *dso, const char
         "-DGGML_CUDA_PEER_MAX_BATCH_SIZE=128",
         "-DGGML_CUDA_MMV_Y=1",
         "-DGGML_USE_TINYBLAS",
-        FLAG_flash_attn ? "-DTEHFLASH" : "-DGGML_MINIMIZE_CODE_SIZE",
+        FLAG_iq || FLAG_flash_attn ? "-DTEHFLASH" : "-DGGML_MINIMIZE_CODE_SIZE",
         "-o",
         (char *)tmpdso,
         (char *)src,
@@ -726,6 +732,7 @@ static bool link_cuda_dso(const char *dso, const char *dir) {
     ok &= !!(ggml_cuda.get_device_count = imp(lib, "ggml_backend_cuda_get_device_count"));
     ok &= !!(ggml_cuda.unreg_host_buf = imp(lib, "ggml_backend_cuda_unregister_host_buffer"));
     ok &= !!(ggml_cuda.register_host_buffer = imp(lib, "ggml_backend_cuda_register_host_buffer"));
+    ok &= !!(ggml_cuda.get_description = imp(lib, "ggml_backend_cuda_get_device_description"));
     if (!ok) {
         tinylog(__func__, ": error: not all cuda symbols could be imported\n", NULL);
         cosmo_dlclose(lib);
@@ -758,7 +765,10 @@ static bool import_cuda_impl(void) {
     default:
         return false;
     }
+
     tinylog(__func__, ": initializing gpu module...\n", NULL);
+
+    npassert(FLAGS_READY);
 
     // extract source code
     char src[PATH_MAX];
@@ -821,12 +831,12 @@ static bool import_cuda_impl(void) {
         llamafile_get_app_dir(dso, PATH_MAX);
         strlcat(dso, "ggml-rocm.", PATH_MAX);
         strlcat(dso, GetDsoExtension(), PATH_MAX);
-        if (FLAG_nocompile) {
+        if (FLAG_nocompile || !FLAG_recompile) {
             if ((FileExists(dso) || extract_cuda_dso(dso, "ggml-rocm")) &&
                 link_cuda_dso(dso, library_path)) {
                 ggml_cuda.has_amd_gpu = true;
                 return true;
-            } else {
+            } else if (FLAG_nocompile) {
                 goto TryNvidia;
             }
         }
@@ -904,9 +914,14 @@ TryNvidia:
         llamafile_get_app_dir(dso, PATH_MAX);
         strlcat(dso, "ggml-cuda.", PATH_MAX);
         strlcat(dso, GetDsoExtension(), PATH_MAX);
-        if (FLAG_nocompile)
-            return ((FileExists(dso) || extract_cuda_dso(dso, "ggml-cuda")) &&
-                    link_cuda_dso(dso, library_path));
+        if (FLAG_nocompile || !FLAG_recompile) {
+            if ((FileExists(dso) || extract_cuda_dso(dso, "ggml-cuda")) &&
+                link_cuda_dso(dso, library_path)) {
+                return true;
+            } else if (FLAG_nocompile) {
+                return false;
+            }
+        }
 
         // Check if DSO is already compiled.
         if (!needs_rebuild && !FLAG_recompile) {
@@ -923,8 +938,9 @@ TryNvidia:
         }
 
         // Try building CUDA from source with mighty cuBLAS.
-        if (compiler_path && compile_nvidia(compiler_path, dso, src))
+        if (compiler_path && compile_nvidia(compiler_path, dso, src)) {
             return link_cuda_dso(dso, library_path);
+        }
 
         // Try extracting prebuilt tinyBLAS DSO from PKZIP.
         if (extract_cuda_dso(dso, "ggml-cuda"))
@@ -1015,4 +1031,11 @@ GGML_CALL bool ggml_backend_cuda_register_host_buffer(void *buffer, size_t size)
     if (!llamafile_has_cuda())
         return false;
     return ggml_cuda.register_host_buffer(buffer, size);
+}
+
+GGML_CALL void ggml_backend_cuda_get_device_description(int device, char *description,
+                                                        size_t description_size) {
+    if (!llamafile_has_cuda())
+        return;
+    return ggml_cuda.get_description(device, description, description_size);
 }

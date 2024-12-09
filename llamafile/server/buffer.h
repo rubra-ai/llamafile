@@ -16,7 +16,10 @@
 // limitations under the License.
 
 #pragma once
-#include <stddef.h>
+#include <cstddef>
+
+namespace lf {
+namespace server {
 
 struct Buffer
 {
@@ -28,3 +31,6 @@ struct Buffer
     explicit Buffer(size_t) noexcept;
     ~Buffer() noexcept;
 };
+
+} // namespace server
+} // namespace lf

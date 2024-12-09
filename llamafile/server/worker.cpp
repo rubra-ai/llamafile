@@ -16,125 +16,154 @@
 // limitations under the License.
 
 #include "worker.h"
-
-#include <assert.h>
+#include "llamafile/llamafile.h"
+#include "llamafile/server/client.h"
+#include "llamafile/server/log.h"
+#include "llamafile/server/server.h"
+#include "llamafile/server/signals.h"
+#include "llamafile/server/tokenbucket.h"
+#include "llamafile/threadlocal.h"
+#include "llamafile/trust.h"
+#include <cosmo.h>
+#include <cassert>
 #include <exception>
 #include <pthread.h>
 
-#include "client.h"
-#include "llamafile/llamafile.h"
-#include "log.h"
-#include "signals.h"
+namespace lf {
+namespace server {
 
-Worker::Worker(Server* server) : server(server)
+Worker::Worker(Server* server, llama_model* model)
+  : server_(server), client_(model)
 {
-    dll_init(&elem);
+    dll_init(&elem_);
 }
 
 void
 Worker::kill()
 {
-    pthread_cancel(th);
+    pthread_cancel(th_);
 }
 
 void
 Worker::begin()
 {
-    unassert(!working);
-    server->lock();
-    dll_remove(&server->idle_workers, &elem);
-    if (dll_is_empty(server->idle_workers)) {
+    npassert(!working_);
+    client_.worker_ = this;
+    client_.client_ip_trusted_ = is_trusted_ip(client_.client_ip_);
+    int tokens = 0;
+    if (!client_.client_ip_trusted_)
+        tokens = tokenbucket_acquire(client_.client_ip_);
+    server_->lock();
+    dll_remove(&server_->idle_workers, &elem_);
+    if (dll_is_empty(server_->idle_workers)) {
         Dll* slowbro;
-        if ((slowbro = dll_last(server->active_workers))) {
-            LOG("all threads active! dropping oldest client");
+        if ((slowbro = dll_last(server_->active_workers))) {
+            SLOG("all threads active! dropping oldest client");
             WORKER(slowbro)->kill();
         }
     }
-    working = true;
-    dll_make_first(&server->active_workers, &elem);
-    server->unlock();
+    working_ = true;
+    if (tokens > FLAG_token_burst) {
+        dll_make_last(&server_->active_workers, &elem_);
+    } else {
+        dll_make_first(&server_->active_workers, &elem_);
+    }
+    server_->unlock();
 }
 
 void
 Worker::end()
 {
-    unassert(working);
-    server->lock();
-    dll_remove(&server->active_workers, &elem);
-    working = false;
-    dll_make_first(&server->idle_workers, &elem);
-    server->unlock();
+    npassert(working_);
+    server_->lock();
+    dll_remove(&server_->active_workers, &elem_);
+    working_ = false;
+    dll_make_first(&server_->idle_workers, &elem_);
+    server_->unlock();
+}
+
+void
+Worker::deprioritize()
+{
+    npassert(working_);
+    server_->lock();
+    dll_remove(&server_->active_workers, &elem_);
+    dll_make_last(&server_->active_workers, &elem_);
+    server_->unlock();
 }
 
 void
 Worker::retire()
 {
-    server->lock();
-    if (working)
-        dll_remove(&server->active_workers, &elem);
+    server_->lock();
+    if (working_)
+        dll_remove(&server_->active_workers, &elem_);
     else
-        dll_remove(&server->idle_workers, &elem);
-    server->worker_count.fetch_sub(1, std::memory_order_acq_rel);
-    server->signal();
-    server->unlock();
+        dll_remove(&server_->idle_workers, &elem_);
+    server_->worker_count.fetch_sub(1, std::memory_order_acq_rel);
+    server_->signal();
+    server_->unlock();
     delete this;
 }
 
 void
-Worker::handle(void)
+Worker::handle()
 {
-    if ((client.fd = server->accept()) == -1) {
-        LOG("accept returned %m");
+    if ((client_.fd_ = server_->accept(&client_.client_ip_)) == -1) {
+        if (IsWindows() && errno == ENOTSOCK) {
+            // Server::shutdown() calls close() on the listening socket
+        } else {
+            SLOG("accept returned %m");
+        }
         return;
     }
 
     begin();
-    pthread_cleanup_push(
-      [](void* arg) {
-          Worker* worker = (Worker*)arg;
-          worker->client.close();
-          worker->end();
-      },
-      this);
 
     try {
-        client.run();
+        client_.run();
     } catch (const std::exception& e) {
-        LOG("caught %s", e.what());
+        SLOG("caught %s", e.what());
     } catch (...) {
-        LOG("caught unknown exception");
+        SLOG("caught unknown exception");
     }
 
-    pthread_cleanup_pop(true);
+    client_.close();
+    end();
 }
 
 void
 Worker::run()
 {
-    server->lock();
-    dll_make_first(&server->idle_workers, &elem);
-    server->worker_count.fetch_add(1, std::memory_order_acq_rel);
-    server->unlock();
+    server_->lock();
+    dll_make_first(&server_->idle_workers, &elem_);
+    server_->worker_count.fetch_add(1, std::memory_order_acq_rel);
+    server_->unlock();
 
-    pthread_cleanup_push(
-      [](void* arg) {
-          Worker* worker = (Worker*)arg;
-          worker->retire();
-      },
-      this);
+    static ThreadLocal<Worker> cleanup([](Worker* worker) {
+        if (worker->working_) {
+            worker->client_.close();
+            worker->end();
+        }
+        worker->retire();
+    });
+    cleanup.set(this);
 
-    while (!server->terminated.load(std::memory_order_acquire)) {
+    while (!server_->terminated.load(std::memory_order_acquire)) {
         sigset_t mask;
         sigemptyset(&mask);
         sigaddset(&mask, SIGHUP);
         sigaddset(&mask, SIGINT);
-        sigaddset(&mask, SIGQUIT);
         sigaddset(&mask, SIGTERM);
         sigaddset(&mask, SIGUSR1);
         sigaddset(&mask, SIGALRM);
-        pthread_sigmask(SIG_BLOCK, &mask, 0);
+        pthread_sigmask(SIG_SETMASK, &mask, 0);
         handle();
     }
 
-    pthread_cleanup_pop(true);
+    cleanup.set(nullptr);
+    retire();
 }
+
+} // namespace server
+} // namespace lf

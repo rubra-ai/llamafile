@@ -15,12 +15,15 @@ LLAMAFILE_DOCS = $(filter %.1,$(LLAMAFILE_FILES))
 LLAMAFILE_OBJS :=					\
 	$(LLAMAFILE_SRCS_C:%.c=o/$(MODE)/%.o)		\
 	$(LLAMAFILE_SRCS_CPP:%.cpp=o/$(MODE)/%.o)	\
-	$(LLAMAFILE_FILES:%=o/$(MODE)/%.zip.o)
+	$(LLAMAFILE_FILES:%=o/$(MODE)/%.zip.o)		\
+
+$(LLAMAFILE_OBJS): private CCFLAGS += -g
 
 # this executable defines its own malloc(), free(), etc.
 # therefore we want to avoid it going inside the .a file
 LLAMAFILE_OBJS := $(filter-out o/$(MODE)/llamafile/zipalign.o,$(LLAMAFILE_OBJS))
 
+include llamafile/highlight/BUILD.mk
 include llamafile/server/BUILD.mk
 
 o/$(MODE)/llamafile/zipalign:				\
@@ -31,25 +34,38 @@ o/$(MODE)/llamafile/zipalign:				\
 
 o/$(MODE)/llamafile/zipcheck:				\
 		o/$(MODE)/llamafile/zipcheck.o		\
-		o/$(MODE)/llamafile/zip.o
+		o/$(MODE)/llamafile/zip.o		\
 
 o/$(MODE)/llamafile/simple:				\
 		o/$(MODE)/llamafile/simple.o		\
-		o/$(MODE)/llama.cpp/llama.cpp.a
+		o/$(MODE)/llama.cpp/llama.cpp.a		\
 
 o/$(MODE)/llamafile/tokenize:				\
 		o/$(MODE)/llamafile/tokenize.o		\
-		o/$(MODE)/llama.cpp/llama.cpp.a
+		o/$(MODE)/llama.cpp/llama.cpp.a		\
+
+o/$(MODE)/llamafile/curl:					\
+		o/$(MODE)/llamafile/curl.o			\
+		o/$(MODE)/llama.cpp/llama.cpp.a			\
+		o/$(MODE)/third_party/mbedtls/mbedtls.a		\
 
 .PHONY: o/$(MODE)/llamafile
-o/$(MODE)/llamafile:					\
-		$(LLAMAFILE_OBJS)			\
-		o/$(MODE)/llamafile/server		\
-		o/$(MODE)/llamafile/simple		\
-		o/$(MODE)/llamafile/zipalign		\
-		o/$(MODE)/llamafile/zipcheck		\
-		o/$(MODE)/llamafile/tokenize		\
-		o/$(MODE)/llamafile/addnl
+o/$(MODE)/llamafile:						\
+		$(LLAMAFILE_OBJS)				\
+		o/$(MODE)/llamafile/server			\
+		o/$(MODE)/llamafile/simple			\
+		o/$(MODE)/llamafile/zipalign			\
+		o/$(MODE)/llamafile/zipcheck			\
+		o/$(MODE)/llamafile/tokenize			\
+		o/$(MODE)/llamafile/addnl			\
+		o/$(MODE)/llamafile/high			\
+		o/$(MODE)/llamafile/datauri_test.runs		\
+		o/$(MODE)/llamafile/parse_cidr_test.runs	\
+		o/$(MODE)/llamafile/pool_cancel_test.runs	\
+		o/$(MODE)/llamafile/pool_test.runs		\
+		o/$(MODE)/llamafile/json_test.runs		\
+		o/$(MODE)/llamafile/thread_test.runs		\
+		o/$(MODE)/llamafile/vmathf_test.runs		\
 
 ################################################################################
 # microarchitectures
@@ -94,27 +110,96 @@ o/$(MODE)/llamafile:					\
 # - HWCAP_ASIMDDP       +dotprod  (e.g. m1, rpi5)  __ARM_FEATURE_DOTPROD
 #
 
-o/$(MODE)/llamafile/sgemm.o: private CXXFLAGS += -Os
-o/$(MODE)/llamafile/iqk_mul_mat_amd_avx2.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mavx2 -Xx86_64-mfma -Xx86_64-mf16c
-o/$(MODE)/llamafile/iqk_mul_mat_amd_zen4.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mavx2 -Xx86_64-mfma -Xx86_64-mf16c -Xx86_64-mavx512f -Xx86_64-mavx512vl -Xx86_64-mavx512vnni -Xx86_64-mavx512bw -Xx86_64-mavx512dq
+o/$(MODE)/llamafile/iqk_mul_mat_amd_avx2.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mavx -Xx86_64-mavx2 -Xx86_64-mfma -Xx86_64-mf16c
+o/$(MODE)/llamafile/iqk_mul_mat_amd_zen4.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mavx -Xx86_64-mavx2 -Xx86_64-mfma -Xx86_64-mf16c -Xx86_64-mavx512f -Xx86_64-mavx512vl -Xx86_64-mavx512vnni -Xx86_64-mavx512bw -Xx86_64-mavx512dq
 o/$(MODE)/llamafile/iqk_mul_mat_arm82.o: private TARGET_ARCH += -Xaarch64-march=armv8.2-a+dotprod+fp16
-o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx.o: private TARGET_ARCH += -Xx86_64-mtune=sandybridge -Xx86_64-mf16c
-o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx.o: private TARGET_ARCH += -Xx86_64-mtune=sandybridge -Xx86_64-mf16c
-o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_fma.o: private TARGET_ARCH += -Xx86_64-mtune=bdver2 -Xx86_64-mf16c -Xx86_64-mfma
-o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_fma.o: private TARGET_ARCH += -Xx86_64-mtune=bdver2 -Xx86_64-mf16c -Xx86_64-mfma
-o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx2.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mfma
-o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx2.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mfma
-o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avxvnni.o: private TARGET_ARCH += -Xx86_64-mtune=alderlake -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavxvnni
-o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avxvnni.o: private TARGET_ARCH += -Xx86_64-mtune=alderlake -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavxvnni
-o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx512f.o: private TARGET_ARCH += -Xx86_64-mtune=cannonlake -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f
-o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx512f.o: private TARGET_ARCH += -Xx86_64-mtune=cannonlake -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f
-o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_zen4.o: private TARGET_ARCH += -Xx86_64-mtune=znver4 -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f -Xx86_64-mavx512vl -Xx86_64-mavx512vnni -Xx86_64-mavx512bf16
-o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_zen4.o: private TARGET_ARCH += -Xx86_64-mtune=znver4 -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f -Xx86_64-mavx512vl -Xx86_64-mavx512vnni -Xx86_64-mavx512bf16
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx.o: private TARGET_ARCH += -Xx86_64-mtune=sandybridge -Xx86_64-mavx -Xx86_64-mf16c
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx.o: private TARGET_ARCH += -Xx86_64-mtune=sandybridge -Xx86_64-mavx -Xx86_64-mf16c
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_fma.o: private TARGET_ARCH += -Xx86_64-mtune=bdver2 -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_fma.o: private TARGET_ARCH += -Xx86_64-mtune=bdver2 -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx2.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mfma
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx2.o: private TARGET_ARCH += -Xx86_64-mtune=skylake -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mfma
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avxvnni.o: private TARGET_ARCH += -Xx86_64-mtune=alderlake -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavxvnni
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avxvnni.o: private TARGET_ARCH += -Xx86_64-mtune=alderlake -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavxvnni
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx512f.o: private TARGET_ARCH += -Xx86_64-mtune=cannonlake -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx512f.o: private TARGET_ARCH += -Xx86_64-mtune=cannonlake -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_zen4.o: private TARGET_ARCH += -Xx86_64-mtune=znver4 -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f -Xx86_64-mavx512vl -Xx86_64-mavx512vnni -Xx86_64-mavx512bf16
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_zen4.o: private TARGET_ARCH += -Xx86_64-mtune=znver4 -Xx86_64-mavx -Xx86_64-mf16c -Xx86_64-mfma -Xx86_64-mavx2 -Xx86_64-mavx512f -Xx86_64-mavx512vl -Xx86_64-mavx512vnni -Xx86_64-mavx512bf16
 o/$(MODE)/llamafile/tinyblas_cpu_sgemm_arm82.o: private TARGET_ARCH += -Xaarch64-march=armv8.2-a+dotprod+fp16
 o/$(MODE)/llamafile/tinyblas_cpu_mixmul_arm82.o: private TARGET_ARCH += -Xaarch64-march=armv8.2-a+dotprod+fp16
 
+o/$(MODE)/llamafile/sgemm.o: private CXXFLAGS += -Os
+
+o/$(MODE)/llamafile/sgemm_matmul_test.o			\
+o/$(MODE)/llamafile/sgemm_sss_test.o			\
+o/$(MODE)/llamafile/sgemm_vecdot_test.o			\
+o/$(MODE)/llamafile/iqk_mul_mat_amd_avx2.o		\
+o/$(MODE)/llamafile/iqk_mul_mat_amd_zen4.o		\
+o/$(MODE)/llamafile/iqk_mul_mat_arm82.o			\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx2.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx512f.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avx.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_avxvnni.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_fma.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_amd_zen4.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_arm80.o		\
+o/$(MODE)/llamafile/tinyblas_cpu_mixmul_arm82.o		\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx2.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx512f.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avx.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_avxvnni.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_fma.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_amd_zen4.o	\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_arm80.o		\
+o/$(MODE)/llamafile/tinyblas_cpu_sgemm_arm82.o:		\
+		private CCFLAGS += -O3 -fopenmp -mgcc
+
 ################################################################################
 # testing
+
+o/$(MODE)/llamafile/json_test:						\
+		o/$(MODE)/llamafile/json_test.o				\
+		o/$(MODE)/llamafile/json.o				\
+		o/$(MODE)/llamafile/hextoint.o				\
+		o/$(MODE)/double-conversion/double-conversion.a		\
+
+o/$(MODE)/llamafile/vmathf_test:			\
+		o/$(MODE)/llamafile/vmathf_test.o	\
+		o/$(MODE)/llama.cpp/llama.cpp.a		\
+
+o/$(MODE)/llamafile/parse_cidr_test:			\
+		o/$(MODE)/llamafile/parse_cidr_test.o	\
+		o/$(MODE)/llamafile/parse_cidr.o	\
+		o/$(MODE)/llamafile/parse_ip.o		\
+
+o/$(MODE)/llamafile/pool_test:				\
+		o/$(MODE)/llamafile/pool_test.o		\
+		o/$(MODE)/llamafile/crash.o		\
+		o/$(MODE)/llamafile/pool.o		\
+
+o/$(MODE)/llamafile/datauri_test:			\
+		o/$(MODE)/llamafile/datauri_test.o	\
+		o/$(MODE)/llama.cpp/llama.cpp.a		\
+		o/$(MODE)/third_party/stb/stb.a		\
+
+o/$(MODE)/llamafile/high:					\
+		o/$(MODE)/llamafile/high.o			\
+		o/$(MODE)/llamafile/highlight/highlight.a	\
+		o/$(MODE)/llama.cpp/llama.cpp.a			\
+
+o/$(MODE)/llamafile/hex2xterm:				\
+		o/$(MODE)/llamafile/hex2xterm.o		\
+		o/$(MODE)/llamafile/xterm.o		\
+
+o/$(MODE)/llamafile/pool_cancel_test:			\
+		o/$(MODE)/llamafile/pool_cancel_test.o	\
+		o/$(MODE)/llamafile/crash.o		\
+		o/$(MODE)/llamafile/pool.o		\
+
+o/$(MODE)/llamafile/thread_test:			\
+		o/$(MODE)/llamafile/thread_test.o	\
+		o/$(MODE)/llamafile/crash.o		\
+		o/$(MODE)/llamafile/dll3.o		\
 
 o/$(MODE)/llamafile/sgemm_sss_test: private LDFLAGS += -fopenmp
 o/$(MODE)/llamafile/sgemm_sss_test.o: private CCFLAGS += -fopenmp
@@ -132,6 +217,9 @@ o/$(MODE)/llamafile/sgemm_matmul_test:			\
 o/$(MODE)/llamafile/sgemm_vecdot_test:			\
 		o/$(MODE)/llamafile/sgemm_vecdot_test.o	\
 		o/$(MODE)/llama.cpp/llama.cpp.a
+
+o/$(MODE)/llamafile/sgemm_vecdot_test:			\
+		private LDFLAGS += -fopenmp
 
 o/$(MODE)/llamafile/%.o: llamafile/%.cu llamafile/BUILD.mk
 	@mkdir -p $(@D)

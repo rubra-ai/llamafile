@@ -1,7 +1,10 @@
+// -*- mode:c++;indent-tabs-mode:nil;c-basic-offset:4;tab-width:8;coding:utf-8 -*-
+// vi: set et ft=cpp ts=4 sts=4 sw=4 fenc=utf-8 :vi
+
 #include <algorithm>
 #include <array>
 #include <cassert>
-#include <chrono>
+// #include <chrono> [jart]
 #include <cinttypes>
 #include <clocale>
 #include <cmath>
@@ -19,15 +22,17 @@
 #include <cosmo.h>
 #include <libgen.h>
 #include <sys/stat.h>
-#include <sys/auxv.h>
 #include <libc/intrin/x86.h>
+#include "llama.cpp/cores.h"
 #include <libc/sysv/consts/hwcap.h>
 
 #include "llama.cpp/ggml.h"
 #include "llama.cpp/llama.h"
+#include "llama.cpp/string.h"
 #include "llama.cpp/common.h"
 #include "llama.cpp/ggml-cuda.h"
 #include "llamafile/llamafile.h"
+#include "llamafile/compute.h"
 
 // utils
 static uint64_t get_time_ns() {
@@ -86,102 +91,6 @@ static T stdev(const std::vector<T> & v) {
     T sq_sum = std::inner_product(v.begin(), v.end(), v.begin(), T(0));
     T stdev = std::sqrt(sq_sum / (T)(v.size() - 1) - mean * mean * (T)v.size() / (T)(v.size() - 1));
     return stdev;
-}
-
-static std::string replaceAll(std::string str, const std::string& from, const std::string& to) {
-    size_t start_pos = 0;
-    while ((start_pos = str.find(from, start_pos)) != std::string::npos) {
-        str.replace(start_pos, from.length(), to);
-        start_pos += to.length(); // Handles case where 'to' is a substring of 'from'
-    }
-    return str;
-}
-
-
-#ifdef __x86_64__
-static void cpuid(unsigned leaf, unsigned subleaf, unsigned *info) {
-    asm("movq\t%%rbx,%%rsi\n\t"
-        "cpuid\n\t"
-        "xchgq\t%%rbx,%%rsi"
-        : "=a"(info[0]), "=S"(info[1]), "=c"(info[2]), "=d"(info[3])
-        : "0"(leaf), "2"(subleaf));
-}
-#endif // __x86_64__
-
-static std::string get_cpu_info() { // [jart]
-    std::string id;
-
-#ifdef __x86_64__
-    union { // [jart]
-        char str[64];
-        unsigned reg[16];
-    } u = {0};
-    cpuid(0x80000002, 0, u.reg + 0*4);
-    cpuid(0x80000003, 0, u.reg + 1*4);
-    cpuid(0x80000004, 0, u.reg + 2*4);
-    int len = strlen(u.str);
-    while (len > 0 && u.str[len - 1] == ' ')
-        u.str[--len] = 0;
-    id = u.str;
-#else
-    if (IsLinux()) {
-        FILE * f = fopen("/proc/cpuinfo", "r");
-        if (f) {
-            char buf[1024];
-            while (fgets(buf, sizeof(buf), f)) {
-                if (!strncmp(buf, "model name", 10) ||
-                    startswith(buf, "Model\t\t:")) { // e.g. raspi
-                    char * p = strchr(buf, ':');
-                    if (p) {
-                        p++;
-                        while (std::isspace(*p)) {
-                            p++;
-                        }
-                        while (std::isspace(p[strlen(p) - 1])) {
-                            p[strlen(p) - 1] = '\0';
-                        }
-                        id = p;
-                        break;
-                    }
-                }
-            }
-            fclose(f);
-        }
-    }
-    if (IsXnu()) {
-        char cpu_name[128] = {0};
-        size_t size = sizeof(cpu_name);
-        if (sysctlbyname("machdep.cpu.brand_string", cpu_name, &size, NULL, 0) != -1) {
-            id = cpu_name;
-        }
-    }
-#endif
-    id = replaceAll(id, " 96-Cores", "");
-    id = replaceAll(id, "(TM)", "");
-    id = replaceAll(id, "(R)", "");
-
-    std::string march;
-#ifdef __x86_64__
-    if (__cpu_march(__cpu_model.__cpu_subtype))
-        march = __cpu_march(__cpu_model.__cpu_subtype);
-#else
-    long hwcap = getauxval(AT_HWCAP);
-    if (hwcap & HWCAP_ASIMDHP)
-        march += "+fp16";
-    if (hwcap & HWCAP_ASIMDDP)
-        march += "+dotprod";
-#endif
-
-    if (!march.empty()) {
-        bool empty = id.empty();
-        if (!empty)
-            id += " (";
-        id += march;
-        if (!empty)
-            id += ")";
-    }
-
-    return id;
 }
 
 static std::string get_gpu_info() {
@@ -271,8 +180,8 @@ static const cmd_params cmd_params_defaults = {
     /* n_pg          */ {},
     /* n_batch       */ {2048},
     /* n_ubatch      */ {512},
-    /* type_k        */ {GGML_TYPE_F16},
-    /* type_v        */ {GGML_TYPE_F16},
+    /* type_k        */ {X86_HAVE(AVX512_BF16) ? GGML_TYPE_BF16 : GGML_TYPE_F16},
+    /* type_v        */ {X86_HAVE(AVX512_BF16) ? GGML_TYPE_BF16 : GGML_TYPE_F16},
     /* n_threads     */ {cpu_get_num_math()},
     /* n_gpu_layers  */ {0},
     /* split_mode    */ {LLAMA_SPLIT_MODE_LAYER},
@@ -455,6 +364,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = true;
                 break;
             }
+            FLAG_gpu = LLAMAFILE_GPU_AUTO;
             auto p = split<int>(argv[i], split_delim);
             params.n_gpu_layers.insert(params.n_gpu_layers.end(), p.begin(), p.end());
         } else if (arg == "-sm" || arg == "--split-mode") {
@@ -988,7 +898,7 @@ const bool        test::metal        = false; // !!ggml_cpu_has_metal(); // [jar
 const bool        test::gpu_blas     = false; // !!ggml_cpu_has_gpublas(); // [jart]
 const bool        test::blas         = false; // !!ggml_cpu_has_blas(); // [jart]
 const bool        test::sycl         = false; // !!ggml_cpu_has_sycl(); // [jart]
-const std::string test::cpu_info     = get_cpu_info();
+const std::string test::cpu_info     = llamafile_describe_cpu();
 const std::string test::gpu_info     = ""; //get_gpu_info(); // [jart]
 
 struct printer {
@@ -1254,7 +1164,7 @@ struct markdown_printer : public printer {
                 snprintf(buf, sizeof(buf), "%.2f", t.avg_ts());
                 value = buf;
             } else if (vmap.find(field) != vmap.end()) {
-                value = replaceAll(replaceAll(vmap.at(field), ".gguf", ""), ".llamafile", ""); // [jart]
+                value = replace_all(replace_all(vmap.at(field), ".gguf", ""), ".llamafile", ""); // [jart]
             } else {
                 assert(false);
                 exit(1);
@@ -1362,11 +1272,10 @@ __attribute__((__constructor__(101))) static void init(void) {
 }
 
 int main(int argc, char ** argv) {
-
     ShowCrashReports();
 
     // try to set locale for unicode characters in markdown
-    setlocale(LC_CTYPE, ".UTF-8");
+    setlocale(LC_CTYPE, "C.UTF-8");  // [jart]
 
     __warn_if_powersave();  // [jart]
     if (!getenv("LLAMAFILE_TEMPERATURE_FILE") || !getenv("LLAMAFILE_TEMPERATURE_MAX"))
@@ -1386,6 +1295,7 @@ int main(int argc, char ** argv) {
 #endif
 
     cmd_params params = parse_cmd_params(argc, argv);
+    FLAGS_READY = true;
 
     // initialize llama.cpp
     if (!params.verbose) {

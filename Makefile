@@ -11,28 +11,32 @@ MAKEFLAGS += --no-builtin-rules
 include build/config.mk
 include build/rules.mk
 
+include third_party/BUILD.mk
 include llamafile/BUILD.mk
 include llama.cpp/BUILD.mk
 include stable-diffusion.cpp/BUILD.mk
-include double-conversion/BUILD.mk
-include stb/BUILD.mk
+include whisper.cpp/BUILD.mk
 
 # the root package is `o//` by default
 # building a package also builds its sub-packages
 .PHONY: o/$(MODE)/
 o/$(MODE)/:	o/$(MODE)/llamafile					\
 		o/$(MODE)/llama.cpp					\
-		o/$(MODE)/stb						\
+		o/$(MODE)/stable-diffusion.cpp				\
+		o/$(MODE)/whisper.cpp					\
+		o/$(MODE)/third_party					\
 		o/$(MODE)/depend.test
 
 # for installing to `make PREFIX=/usr/local`
 .PHONY: install
 install:	llamafile/zipalign.1					\
+		llamafile/server/main.1					\
 		llama.cpp/main/main.1					\
 		llama.cpp/imatrix/imatrix.1				\
 		llama.cpp/quantize/quantize.1				\
 		llama.cpp/perplexity/perplexity.1			\
 		llama.cpp/llava/llava-quantize.1			\
+		whisper.cpp/main.1					\
 		o/$(MODE)/llamafile/zipalign				\
 		o/$(MODE)/llamafile/tokenize				\
 		o/$(MODE)/llama.cpp/main/main				\
@@ -40,7 +44,9 @@ install:	llamafile/zipalign.1					\
 		o/$(MODE)/llama.cpp/quantize/quantize			\
 		o/$(MODE)/llama.cpp/llama-bench/llama-bench		\
 		o/$(MODE)/llama.cpp/perplexity/perplexity		\
-		o/$(MODE)/llama.cpp/llava/llava-quantize
+		o/$(MODE)/llama.cpp/llava/llava-quantize		\
+		o/$(MODE)/whisper.cpp/main				\
+		o/$(MODE)/llamafile/server/main
 	mkdir -p $(PREFIX)/bin
 	$(INSTALL) o/$(MODE)/llamafile/zipalign $(PREFIX)/bin/zipalign
 	$(INSTALL) o/$(MODE)/llamafile/tokenize $(PREFIX)/bin/llamafile-tokenize
@@ -52,13 +58,18 @@ install:	llamafile/zipalign.1					\
 	$(INSTALL) build/llamafile-upgrade-engine $(PREFIX)/bin/llamafile-upgrade-engine
 	$(INSTALL) o/$(MODE)/llama.cpp/perplexity/perplexity $(PREFIX)/bin/llamafile-perplexity
 	$(INSTALL) o/$(MODE)/llama.cpp/llava/llava-quantize $(PREFIX)/bin/llava-quantize
+	$(INSTALL) o/$(MODE)/llamafile/server/main $(PREFIX)/bin/llamafiler
+	$(INSTALL) o/$(MODE)/stable-diffusion.cpp/main $(PREFIX)/bin/sdfile
+	$(INSTALL) o/$(MODE)/whisper.cpp/main $(PREFIX)/bin/whisperfile
 	mkdir -p $(PREFIX)/share/man/man1
 	$(INSTALL) -m 0644 llamafile/zipalign.1 $(PREFIX)/share/man/man1/zipalign.1
+	$(INSTALL) -m 0644 llamafile/server/main.1 $(PREFIX)/share/man/man1/llamafiler.1
 	$(INSTALL) -m 0644 llama.cpp/main/main.1 $(PREFIX)/share/man/man1/llamafile.1
 	$(INSTALL) -m 0644 llama.cpp/imatrix/imatrix.1 $(PREFIX)/share/man/man1/llamafile-imatrix.1
 	$(INSTALL) -m 0644 llama.cpp/quantize/quantize.1 $(PREFIX)/share/man/man1/llamafile-quantize.1
 	$(INSTALL) -m 0644 llama.cpp/perplexity/perplexity.1 $(PREFIX)/share/man/man1/llamafile-perplexity.1
 	$(INSTALL) -m 0644 llama.cpp/llava/llava-quantize.1 $(PREFIX)/share/man/man1/llava-quantize.1
+	$(INSTALL) -m 0644 whisper.cpp/main.1 $(PREFIX)/share/man/man1/whisperfile.1
 
 .PHONY: check
 check: o/$(MODE)/llamafile/check

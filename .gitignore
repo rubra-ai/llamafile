@@ -7,6 +7,7 @@
 /cosmocc
 /perf.data
 /perf.data.old
+/trace.json
 
 /*.log
 *.DS_Store

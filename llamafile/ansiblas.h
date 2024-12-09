@@ -20,12 +20,14 @@
 #include <cmath>
 #include <unistd.h>
 
+#include "llama.cpp/cores.h"
+
 namespace {
 namespace ansiBLAS {
 
 static constexpr int KN = 8;
 
-alignas(64) union Vector {
+union Vector {
     double v[KN];
 };
 
@@ -92,7 +94,7 @@ struct ansiBLAS {
     }
 
     template <int RM, int RN>
-    __target_clones("avx512f,fma") void gemm(int m0, int m, int n0, int n) {
+    void gemm(int m0, int m, int n0, int n) {
         int ytiles = (m - m0) / RM;
         int xtiles = (n - n0) / RN;
         int tiles = xtiles * ytiles;
@@ -133,7 +135,7 @@ void sgemm(int m, int n, int k, //
            const float *A, int lda, //
            const float *B, int ldb, //
            float *C, int ldc) {
-    int nth = sysconf(_SC_NPROCESSORS_ONLN);
+    static int nth = cpu_get_num_math();
 #pragma omp parallel for
     for (int ith = 0; ith < nth; ++ith) {
         ansiBLAS tb{k, A, lda, B, ldb, C, ldc, ith, nth};

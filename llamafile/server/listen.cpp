@@ -15,27 +15,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "server.h"
-
+#include "llamafile/llamafile.h"
+#include "llamafile/server/log.h"
+#include "llamafile/server/server.h"
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 
-#include "log.h"
+namespace lf {
+namespace server {
 
 void
 print_listening_url(unsigned ip, int port)
 {
-    LOG("listen http://%hhu.%hhu.%hhu.%hhu:%hu",
-        ip >> 24,
-        ip >> 16,
-        ip >> 8,
-        ip,
-        port);
+    SLOG("listen http://%hhu.%hhu.%hhu.%hhu:%hu%s",
+         ip >> 24,
+         ip >> 16,
+         ip >> 8,
+         ip,
+         port,
+         FLAG_url_prefix);
 }
 
 int
@@ -105,6 +108,7 @@ create_listening_socket(const char* hostport)
         uint32_t* hostips;
         for (hostips = GetHostIps(), i = 0; hostips[i]; ++i)
             print_listening_url(hostips[i], ntohs(in->sin_port));
+        free(hostips);
     } else {
         print_listening_url(ntohl(in->sin_addr.s_addr), ntohs(in->sin_port));
     }
@@ -112,3 +116,6 @@ create_listening_socket(const char* hostport)
     freeaddrinfo(ai);
     return fd;
 }
+
+} // namespace server
+} // namespace lf

@@ -16,9 +16,13 @@
 // limitations under the License.
 
 #include "utils.h"
+#include <string_view>
+
+namespace lf {
+namespace server {
 
 bool
-atob(ctl::string_view val, bool dflt)
+atob(std::string_view val, bool dflt)
 {
     if (val == "0")
         return false;
@@ -30,3 +34,6 @@ atob(ctl::string_view val, bool dflt)
         return true;
     return dflt;
 }
+
+} // namespace server
+} // namespace lf

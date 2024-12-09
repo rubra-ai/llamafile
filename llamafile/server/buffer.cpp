@@ -16,11 +16,13 @@
 // limitations under the License.
 
 #include "buffer.h"
-
-#include <sys/auxv.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
-static int pagesz = getauxval(AT_PAGESZ);
+namespace lf {
+namespace server {
+
+static int pagesz = getpagesize();
 
 Buffer::Buffer(size_t capacity) noexcept
   : i(0)
@@ -46,3 +48,6 @@ Buffer::~Buffer() noexcept
     if (munmap(p, c + pagesz))
         __builtin_trap();
 }
+
+} // namespace server
+} // namespace lf

@@ -15,13 +15,12 @@
 #include <string>
 #include <unistd.h>
 #include <vector>
-#include <tool/args/args.h>
-#include <sys/auxv.h>
-#include <stdatomic.h>
-#include <third_party/nsync/futex.internal.h>
+#include <cosmo.h>
 
 #include "llamafile/version.h"
+#include "llamafile/chatbot.h"
 #include "llama.cpp/llama.h"
+#include "llama.cpp/string.h"
 #include "llama.cpp/common.h"
 #include "llama.cpp/console.h"
 #include "llama.cpp/ggml-cuda.h"
@@ -35,14 +34,15 @@ static gpt_params               * g_params;
 static std::vector<llama_token> * g_input_tokens;
 static std::ostringstream       * g_output_ss;
 static std::vector<llama_token> * g_output_tokens;
-static bool is_interacting = false;
+static bool is_interacting  = false;
+static bool need_insert_eot = false;
 
-static bool file_exists(const std::string &path) {
+static bool file_exists(const std::string & path) {
     std::ifstream f(path.c_str());
     return f.good();
 }
 
-static bool file_is_empty(const std::string &path) {
+static bool file_is_empty(const std::string & path) {
     std::ifstream f;
     f.exceptions(std::ifstream::failbit | std::ifstream::badbit);
     f.open(path.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
@@ -58,9 +58,9 @@ static void write_logfile(
         return;
     }
 
-    const std::string timestamp = get_sortable_timestamp();
+    const std::string timestamp = string_get_sortable_timestamp();
 
-    const bool success = create_directory_with_parents(params.logdir);
+    const bool success = fs_create_directory_with_parents(params.logdir);
     if (!success) {
         fprintf(stderr, "%s: warning: failed to create logdir %s, cannot write logfile\n",
                 __func__, params.logdir.c_str());
@@ -68,7 +68,7 @@ static void write_logfile(
     }
 
     const std::string logfile_path = params.logdir + timestamp + ".yml";
-    FILE * logfile = fopen(logfile_path.c_str(), "we");
+    FILE * logfile = fopen(logfile_path.c_str(), "w");
 
     if (logfile == NULL) {
         fprintf(stderr, "%s: failed to open logfile %s\n", __func__, logfile_path.c_str());
@@ -78,7 +78,7 @@ static void write_logfile(
     fprintf(logfile, "binary: main\n");
     char model_desc[128];
     llama_model_desc(model, model_desc, sizeof(model_desc));
-    dump_non_result_info_yaml(logfile, params, ctx, timestamp, input_tokens, model_desc);
+    yaml_dump_non_result_info(logfile, params, ctx, timestamp, input_tokens, model_desc);
 
     fprintf(logfile, "\n");
     fprintf(logfile, "######################\n");
@@ -86,18 +86,18 @@ static void write_logfile(
     fprintf(logfile, "######################\n");
     fprintf(logfile, "\n");
 
-    dump_string_yaml_multiline(logfile, "output", output.c_str());
-    dump_vector_int_yaml(logfile, "output_tokens", output_tokens);
+    yaml_dump_string_multiline(logfile, "output", output.c_str());
+    yaml_dump_vector_int(logfile, "output_tokens", output_tokens);
 
     llama_dump_timing_info_yaml(logfile, ctx);
     fclose(logfile);
 }
 
-static atomic_int is_killed;
+static int is_killed;
 
 static void *safe_sigint_handler(void *arg) {
     while (!is_killed)
-        nsync_futex_wait_(&is_killed, 0, 0, 0);
+        cosmo_futex_wait(&is_killed, 0, 0, 0, 0);
     console::cleanup();
     printf("\n");
     llama_print_timings(*g_ctx);
@@ -111,8 +111,6 @@ static void launch_sigint_thread(void) {
     sigfillset(&block_every_signal);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 65536);
-    pthread_attr_setguardsize(&attr, getauxval(AT_PAGESZ));
     pthread_attr_setsigmask_np(&attr, &block_every_signal);
     pthread_create(&th, &attr, safe_sigint_handler, 0);
     pthread_attr_destroy(&attr);
@@ -124,7 +122,7 @@ static void sigint_handler(int signo) {
             is_interacting = true;
         } else {
             is_killed = true;
-            nsync_futex_wake_(&is_killed, 1, 0);
+            cosmo_futex_wake(&is_killed, 1, 0);
             for (;;) {
             }
         }
@@ -137,7 +135,44 @@ static void llama_log_callback_logTee(ggml_log_level level, const char * text, v
     LOG_TEE("%s", text);
 }
 
+static std::string chat_add_and_format(struct llama_model * model, std::vector<llama_chat_msg> & chat_msgs, std::string role, std::string content) {
+    llama_chat_msg new_msg{role, content};
+    auto formatted = llama_chat_format_single(
+        model, g_params->chat_template, chat_msgs, new_msg, role == "user");
+    chat_msgs.push_back({role, content});
+    LOG("formatted: %s\n", formatted.c_str());
+    return formatted;
+}
+
+enum Program {
+    UNKNOWN,
+    MAIN,
+    SERVER,
+    CHATBOT,
+    EMBEDDING,
+};
+
+enum Program determine_program(char *argv[]) {
+    enum Program prog = UNKNOWN;
+    for (int i = 0; argv[i]; ++i) {
+        if (!strcmp(argv[i], "--cli")) {
+            prog = MAIN;
+        } else if (!strcmp(argv[i], "--chat")) {
+            prog = CHATBOT;
+        } else if (!strcmp(argv[i], "--server")) {
+            prog = SERVER;
+        } else if (!strcmp(argv[i], "--embedding")) {
+            prog = EMBEDDING;
+        }
+    }
+    return prog;
+}
+
 int main(int argc, char ** argv) {
+
+    mallopt(M_GRANULARITY, 2 * 1024 * 1024);
+    mallopt(M_MMAP_THRESHOLD, 16 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
 
     if (llamafile_has(argv, "--version")) {
         puts("llamafile v" LLAMAFILE_VERSION_STRING);
@@ -153,32 +188,41 @@ int main(int argc, char ** argv) {
 
     llamafile_check_cpu();
     ShowCrashReports();
-    LoadZipArgs(&argc, &argv);
-    launch_sigint_thread();
+    argc = cosmo_args("/zip/.args", &argv);
 
-    if (!llamafile_has(argv, "--cli") &&
-        (llamafile_has(argv, "--server") ||
-         (!llamafile_has(argv, "-p") &&
-          !llamafile_has(argv, "-f") &&
-          !llamafile_has(argv, "--random-prompt")))) {
+    enum Program prog = determine_program(argv);
+
+    if (prog == SERVER)
         return server_cli(argc, argv);
+
+    if (prog == CHATBOT ||
+        (prog == UNKNOWN &&
+         !llamafile_has(argv, "-p") &&
+         !llamafile_has(argv, "-f") &&
+         !llamafile_has(argv, "--random-prompt"))) {
+        return lf::chatbot::main(argc, argv);
     }
 
-    if (llamafile_has(argv, "--embedding")) {
+    if (prog == EMBEDDING) {
         int embedding_cli(int, char **);
         return embedding_cli(argc, argv);
     }
+
+    launch_sigint_thread();
 
     gpt_params params;
     g_params = &params;
 
     if (!gpt_params_parse(argc, argv, params)) {
+        gpt_params_print_usage(argc, argv, params);
         return 1;
     }
+
     llama_sampling_params & sparams = params.sparams;
 
 #ifndef LOG_DISABLE_LOGS
     log_set_target(log_filename_generator("main", "log"));
+    LOG_TEE("Log start\n");
     log_dump_cmdline(argc, argv);
     llama_log_set(llama_log_callback_logTee, nullptr);
 #endif // LOG_DISABLE_LOGS
@@ -188,7 +232,7 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    if (!FLAG_unsecure && !llamafile_has_gpu()) {
+    if (!FLAG_unsecure && !llamafile_has_gpu() && !g_server_background_mode) {
         // Enable pledge() security on Linux and OpenBSD.
         // - We do this *after* opening the log file for writing.
         // - We do this *before* loading any weights or graphdefs.
@@ -223,7 +267,7 @@ int main(int argc, char ** argv) {
 
     // save choice to use color for later
     // (note for later: this is a slightly awkward choice)
-    console::init(!params.interactive || params.simple_io, params.use_color);
+    console::init(params.simple_io, params.use_color);
     atexit([]() { console::cleanup(); });
 
     if (params.logits_all) {
@@ -255,7 +299,8 @@ int main(int argc, char ** argv) {
         LOG_TEE("%s: warning: scaling RoPE frequency by %g.\n", __func__, params.rope_freq_scale);
     }
 
-    print_build_info();
+    LOG_TEE("%s: build = %d (%s)\n",      __func__, LLAMA_BUILD_NUMBER, LLAMA_COMMIT);
+    LOG_TEE("%s: built with %s for %s\n", __func__, LLAMA_COMPILER, LLAMA_BUILD_TARGET);
 
     if (params.seed == LLAMA_DEFAULT_SEED) {
         params.seed = time(NULL);
@@ -264,9 +309,6 @@ int main(int argc, char ** argv) {
     LOG_TEE("%s: seed  = %u\n", __func__, params.seed);
 
     std::mt19937 rng(params.seed);
-    if (params.random_prompt) {
-        params.prompt = gpt_random_prompt(rng);
-    }
 
     LOG("%s: llama backend init\n", __func__);
     llama_backend_init();
@@ -275,12 +317,16 @@ int main(int argc, char ** argv) {
     llama_model * model;
     llama_context * ctx;
     llama_context * ctx_guidance = NULL;
+    std::vector<llama_chat_msg> chat_msgs;
     g_model = &model;
     g_ctx = &ctx;
 
     // load the model and apply lora adapter, if any
     LOG("%s: load the model and apply lora adapter, if any\n", __func__);
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
+    llama_init_result llama_init = llama_init_from_gpt_params(params);
+
+    model = llama_init.model;
+    ctx = llama_init.context;
     if (sparams.cfg_scale > 1.f) {
         struct llama_context_params lparams = llama_context_params_from_gpt_params(params);
         ctx_guidance = llama_new_context_with_model(model, lparams);
@@ -300,10 +346,19 @@ int main(int argc, char ** argv) {
                 __func__, n_ctx_train, n_ctx);
     }
 
+    // print chat template example in conversation mode
+    if (params.conversation) {
+        if (params.enable_chat_template) {
+            LOG_TEE("%s: chat template example: %s\n", __func__, llama_chat_format_example(model, params.chat_template).c_str());
+        } else {
+            LOG_TEE("%s: in-suffix/prefix is specified, chat template will be disabled\n", __func__);
+        }
+    }
+
     // print system information
     {
         LOG_TEE("\n");
-        LOG_TEE("%s\n", get_system_info(params).c_str());
+        LOG_TEE("%s\n", gpt_params_get_system_info(params).c_str());
     }
 
     std::string path_session = params.path_prompt_cache;
@@ -328,30 +383,39 @@ int main(int argc, char ** argv) {
         }
     }
 
-    const bool add_bos = llama_should_add_bos_token(model);
-    GGML_ASSERT(llama_add_eos_token(model) != 1);
+    const bool add_bos = llama_add_bos_token(model);
+    if (!llama_model_has_encoder(model)) {
+        GGML_ASSERT(llama_add_eos_token(model) != 1);
+    }
     LOG("add_bos: %d\n", add_bos);
 
     std::vector<llama_token> embd_inp;
 
-    if (params.interactive_first || params.instruct || params.chatml || !params.prompt.empty() || session_tokens.empty()) {
-        LOG("tokenize the prompt\n");
-        if (params.chatml) {
-            params.prompt = "<|im_start|>system\n" + params.prompt + "<|im_end|>";
+    {
+        auto prompt = (params.conversation && params.enable_chat_template && !params.prompt.empty())
+            ? chat_add_and_format(model, chat_msgs, "system", params.prompt) // format the system prompt in conversation mode
+            : params.prompt;
+        if (params.interactive_first || !params.prompt.empty() || session_tokens.empty()) {
+            LOG("tokenize the prompt\n");
+            embd_inp = ::llama_tokenize(ctx, prompt, true, true);
+        } else {
+            LOG("use session tokens\n");
+            embd_inp = session_tokens;
         }
-        embd_inp = ::llama_tokenize(ctx, params.prompt, true, true);
-    } else {
-        LOG("use session tokens\n");
-        embd_inp = session_tokens;
-    }
 
-    LOG("prompt: \"%s\"\n", log_tostr(params.prompt));
-    LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+        LOG("prompt: \"%s\"\n", log_tostr(prompt));
+        LOG("tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+    }
 
     // Should not run without any tokens
     if (embd_inp.empty()) {
-        embd_inp.push_back(llama_token_bos(model));
-        LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+        if (add_bos) {
+            embd_inp.push_back(llama_token_bos(model));
+            LOG("embd_inp was considered empty and bos was added: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, embd_inp).c_str());
+        } else {
+            LOG_TEE("error: input is empty\n");
+            return -1;
+        }
     }
 
     // Tokenize negative prompt
@@ -416,37 +480,13 @@ int main(int argc, char ** argv) {
     }
 
     // number of tokens to keep when resetting context
-    if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size() || params.instruct || params.chatml) {
+    if (params.n_keep < 0 || params.n_keep > (int) embd_inp.size()) {
         params.n_keep = (int)embd_inp.size();
     } else {
         params.n_keep += add_bos; // always keep the BOS token
     }
 
-    // prefix & suffix for instruct mode
-    const auto inp_pfx = ::llama_tokenize(ctx, "\n\n### Instruction:\n\n", true,  true);
-    const auto inp_sfx = ::llama_tokenize(ctx, "\n\n### Response:\n\n",    false, true);
-
-    LOG("inp_pfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, inp_pfx).c_str());
-    LOG("inp_sfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, inp_sfx).c_str());
-
-    // chatml prefix & suffix
-    const auto cml_pfx = ::llama_tokenize(ctx, "\n<|im_start|>user\n", true, true);
-    const auto cml_sfx = ::llama_tokenize(ctx, "<|im_end|>\n<|im_start|>assistant\n", false, true);
-
-    LOG("cml_pfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, cml_pfx).c_str());
-    LOG("cml_sfx: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, cml_sfx).c_str());
-
-    // in instruct mode, we inject a prefix and a suffix to each input by the user
-    if (params.instruct) {
-        params.interactive_first = true;
-        params.antiprompt.emplace_back("### Instruction:\n\n");
-    }
-    // similar for chatml mode
-    else if (params.chatml) {
-        params.interactive_first = true;
-        params.antiprompt.emplace_back("<|im_start|>user\n");
-    }
-    else if (params.conversation) {
+    if (params.conversation) {
         params.interactive_first = true;
     }
 
@@ -482,11 +522,11 @@ int main(int argc, char ** argv) {
         LOG_TEE("\n");
     }
 
-    struct sigaction sa;
+    struct sigaction sa, oldsa;
     sa.sa_handler = sigint_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGINT, &sa, &oldsa);
 
     if (params.interactive) {
         LOG_TEE("%s: interactive mode on.\n", __func__);
@@ -548,12 +588,12 @@ int main(int argc, char ** argv) {
     LOG_TEE("\n\n");
 
     if (params.interactive) {
-        const char *control_message;
+        const char * control_message;
         if (params.multiline_input) {
-            control_message = " - To return control to LLaMa, end your input with '\\'.\n"
+            control_message = " - To return control to the AI, end your input with '\\'.\n"
                               " - To return control without starting a new line, end your input with '/'.\n";
         } else {
-            control_message = " - Press Return to return control to LLaMa.\n"
+            control_message = " - Press Return to return control to the AI.\n"
                               " - To return control without starting a new line, end your input with '/'.\n"
                               " - If you want to submit another line, end your input with '\\'.\n";
         }
@@ -580,6 +620,7 @@ int main(int argc, char ** argv) {
     std::vector<int>   input_tokens;  g_input_tokens  = &input_tokens;
     std::vector<int>   output_tokens; g_output_tokens = &output_tokens;
     std::ostringstream output_ss;     g_output_ss     = &output_ss;
+    std::ostringstream assistant_ss; // for storing current assistant message, used in conversation mode
 
     // the first thing we will do is to output the prompt, so set color accordingly
     console::set_display(console::prompt);
@@ -600,6 +641,24 @@ int main(int argc, char ** argv) {
     if (!ctx_sampling) {
         fprintf(stderr, "%s: failed to initialize sampling subsystem\n", __func__);
         exit(1);
+    }
+
+    if (llama_model_has_encoder(model)) {
+        int enc_input_size = embd_inp.size();
+        llama_token * enc_input_buf = embd_inp.data();
+
+        if (llama_encode(ctx, llama_batch_get_one(enc_input_buf, enc_input_size, 0, 0))) {
+            LOG_TEE("%s : failed to eval\n", __func__);
+            return 1;
+        }
+
+        llama_token decoder_start_token_id = llama_model_decoder_start_token(model);
+        if (decoder_start_token_id == -1) {
+            decoder_start_token_id = llama_token_bos(model);
+        }
+
+        embd_inp.clear();
+        embd_inp.push_back(decoder_start_token_id);
     }
 
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
@@ -814,19 +873,26 @@ int main(int argc, char ** argv) {
         // display text
         if (input_echo && display) {
             for (auto id : embd) {
-                // [jart] don't print special tokens until its design stabilizes
-                const std::string token_str = llama_token_to_piece(ctx, id, false);
-                printf("%s", token_str.c_str());
+                const std::string token_str = llama_token_to_piece(ctx, id, params.special);
 
+                // Console/Stream Output
+                fprintf(stdout, "%s", token_str.c_str());
+
+                // Record Displayed Tokens To Log
+                // Note: Generated tokens are created one by one hence this check
                 if (embd.size() > 1) {
+                    // Incoming Requested Tokens
                     input_tokens.push_back(id);
                 } else {
+                    // Outgoing Generated Tokens
                     output_tokens.push_back(id);
                     output_ss << token_str;
                 }
+
+                fflush(stdout);
             }
-            fflush(stdout);
         }
+
         // reset color to default if there is no pending user input
         if (input_echo && (int) embd_inp.size() == n_consumed) {
             console::set_display(console::reset);
@@ -888,17 +954,24 @@ int main(int argc, char ** argv) {
                         is_antiprompt = true;
                     }
 
+                    if (params.enable_chat_template) {
+                        chat_add_and_format(model, chat_msgs, "assistant", assistant_ss.str());
+                    }
                     is_interacting = true;
                     printf("\n");
-                } else if (params.instruct || params.chatml) {
-                    is_interacting = true;
                 }
+            }
+
+            // if current token is not EOG, we add it to current assistant message
+            if (params.conversation) {
+                auto id = llama_sampling_last(ctx_sampling);
+                assistant_ss << llama_token_to_piece(ctx, id, false);
             }
 
             if (n_past > 0 && is_interacting) {
                 LOG("waiting for user input\n");
 
-                if (params.conversation || params.instruct || params.chatml) {
+                if (params.conversation) {
                     printf("\n> ");
                 }
 
@@ -941,48 +1014,40 @@ int main(int argc, char ** argv) {
 
                     const size_t original_size = embd_inp.size();
 
-                    // instruct mode: insert instruction prefix
-                    if (params.instruct && !is_antiprompt) {
-                        LOG("inserting instruction prefix\n");
-                        n_consumed = embd_inp.size();
-                        embd_inp.insert(embd_inp.end(), inp_pfx.begin(), inp_pfx.end());
-                    }
-                    // chatml mode: insert user chat prefix
-                    if (params.chatml && !is_antiprompt) {
-                        LOG("inserting chatml prefix\n");
-                        n_consumed = embd_inp.size();
-                        embd_inp.insert(embd_inp.end(), cml_pfx.begin(), cml_pfx.end());
-                    }
                     if (params.escape) {
-                        process_escapes(buffer);
+                        string_process_escapes(buffer);
                     }
 
+                    bool format_chat = params.conversation && params.enable_chat_template;
+                    std::string user_inp = format_chat
+                        ? chat_add_and_format(model, chat_msgs, "user", std::move(buffer))
+                        : std::move(buffer);
+                    // TODO: one inconvenient of current chat template implementation is that we can't distinguish between user input and special tokens (prefix/postfix)
                     const auto line_pfx = ::llama_tokenize(ctx, params.input_prefix, false, true);
-                    const auto line_inp = ::llama_tokenize(ctx, buffer,              false, params.interactive_specials);
+                    const auto line_inp = ::llama_tokenize(ctx, user_inp,            false, format_chat);
                     const auto line_sfx = ::llama_tokenize(ctx, params.input_suffix, false, true);
 
                     LOG("input tokens: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, line_inp).c_str());
 
+                    // if user stop generation mid-way, we must add EOT to finish model's last response
+                    if (need_insert_eot && format_chat) {
+                        llama_token eot = llama_token_eot(model);
+                        embd_inp.push_back(eot == -1 ? llama_token_eos(model) : eot);
+                        need_insert_eot = false;
+                    }
+
                     embd_inp.insert(embd_inp.end(), line_pfx.begin(), line_pfx.end());
                     embd_inp.insert(embd_inp.end(), line_inp.begin(), line_inp.end());
                     embd_inp.insert(embd_inp.end(), line_sfx.begin(), line_sfx.end());
-
-                    // instruct mode: insert response suffix
-                    if (params.instruct) {
-                        LOG("inserting instruction suffix\n");
-                        embd_inp.insert(embd_inp.end(), inp_sfx.begin(), inp_sfx.end());
-                    }
-                    // chatml mode: insert assistant chat suffix
-                    if (params.chatml) {
-                        LOG("inserting chatml suffix\n");
-                        embd_inp.insert(embd_inp.end(), cml_sfx.begin(), cml_sfx.end());
-                    }
 
                     for (size_t i = original_size; i < embd_inp.size(); ++i) {
                         const llama_token token = embd_inp[i];
                         output_tokens.push_back(token);
                         output_ss << llama_token_to_piece(ctx, token);
                     }
+
+                    // reset assistant message
+                    assistant_ss.str("");
 
                     n_remain -= line_inp.size();
                     LOG("n_remain: %d\n", n_remain);
@@ -1002,7 +1067,7 @@ int main(int argc, char ** argv) {
         }
 
         // end of generation
-        if (!embd.empty() && llama_token_is_eog(model, embd.back()) && !(params.instruct || params.interactive || params.chatml)) {
+        if (!embd.empty() && llama_token_is_eog(model, embd.back()) && !(params.interactive)) {
             LOG_TEE(" [end of text]\n");
             break;
         }
@@ -1015,13 +1080,15 @@ int main(int argc, char ** argv) {
         }
     }
 
-    // [jart] ensure trailing newline
-    printf("\n");
-
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG_TEE("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
         llama_state_save_file(ctx, path_session.c_str(), session_tokens.data(), session_tokens.size());
     }
+
+    sigaction(SIGINT, &oldsa, 0);
+
+    // [jart] ensure trailing newline
+    printf("\n");
 
     llama_print_timings(ctx);
     write_logfile(ctx, params, model, input_tokens, output_ss.str(), output_tokens);

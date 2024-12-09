@@ -6,6 +6,9 @@
 #ifdef GGML_USE_HIPBLAS
 #define GGML_CUDA_NAME "ROCm"
 #define GGML_CUBLAS_NAME "hipBLAS"
+#elif defined(GGML_USE_MUSA)
+#define GGML_CUDA_NAME "MUSA"
+#define GGML_CUBLAS_NAME "muBLAS"
 #else
 #define GGML_CUDA_NAME "CUDA"
 #define GGML_CUBLAS_NAME "cuBLAS"
@@ -41,6 +44,9 @@ GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, si
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
+
+GGML_API GGML_CALL int ggml_backend_cuda_reg_devices(); // [jart]
+
 #ifdef  __cplusplus
 }
 #endif

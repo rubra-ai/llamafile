@@ -15,36 +15,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include <assert.h>
-#include <third_party/dlmalloc/dlmalloc.h>
-#include <tool/args/args.h>
-
 #include "llama.cpp/llama.h"
 #include "llamafile/llamafile.h"
+#include "llamafile/pool.h"
+#include "llamafile/server/log.h"
+#include "llamafile/server/server.h"
+#include "llamafile/server/signals.h"
+#include "llamafile/server/slots.h"
+#include "llamafile/server/time.h"
+#include "llamafile/server/tokenbucket.h"
+#include "llamafile/server/utils.h"
 #include "llamafile/version.h"
+#include <cassert>
+#include <cosmo.h>
 
-#include "json.h"
-#include "log.h"
-#include "server.h"
-#include "signals.h"
-#include "time.h"
+namespace lf {
+namespace server {
 
 Server* g_server;
-llama_model* g_model;
 
 int
 main(int argc, char* argv[])
 {
+    signal(SIGPIPE, SIG_IGN);
+    mallopt(M_GRANULARITY, 2 * 1024 * 1024);
+    mallopt(M_MMAP_THRESHOLD, 16 * 1024 * 1024);
+    mallopt(M_TRIM_THRESHOLD, 128 * 1024 * 1024);
     llamafile_check_cpu();
+    ShowCrashReports();
+
     if (llamafile_has(argv, "--version")) {
-        puts("llamafile-server v" LLAMAFILE_VERSION_STRING);
+        puts("llamafiler v" LLAMAFILE_VERSION_STRING);
         exit(0);
     }
 
+    if (llamafile_has(argv, "-h") || llamafile_has(argv, "-help") ||
+        llamafile_has(argv, "--help")) {
+        llamafile_help("/zip/llamafile/server/main.1.asc");
+        __builtin_unreachable();
+    }
+
     // get config
-    LoadZipArgs(&argc, &argv);
+    argc = cosmo_args("/zip/.args", &argv);
     llamafile_get_flags(argc, argv);
+
+    // initialize subsystems
     time_init();
+    tokenbucket_init();
+
+    // we must disable the llama.cpp logger
+    // otherwise pthread_cancel() will cause deadlocks
+    FLAG_log_disable = true;
 
     // load model
     llama_model_params mparams = {
@@ -56,36 +77,75 @@ main(int argc, char* argv[])
         .progress_callback = nullptr,
         .progress_callback_user_data = nullptr,
         .kv_overrides = nullptr,
-        .vocab_only = true,
+        .vocab_only = false,
         .use_mmap = true,
         .use_mlock = false,
         .check_tensors = false,
     };
-    g_model = llama_load_model_from_file(FLAG_model, mparams);
+    llama_model* model = llama_load_model_from_file(FLAG_model, mparams);
+    if (!model) {
+        fprintf(stderr, "%s: failed to load model\n", FLAG_model);
+        exit(1);
+    }
+
+    // create slots
+    Slots* slots = new Slots(model);
+    if (!slots->start(FLAG_slots)) {
+        SLOG("no slots could be created");
+        exit(1);
+    }
 
     // create server
     if (FLAG_workers <= 0)
-        FLAG_workers = __get_cpu_count();
+        FLAG_workers = __get_cpu_count() + 4;
     if (FLAG_workers <= 0)
         FLAG_workers = 16;
     set_thread_name("server");
-    g_server = new Server(create_listening_socket(FLAG_listen));
+    g_server = new Server(create_listening_socket(FLAG_listen), slots, model);
     for (int i = 0; i < FLAG_workers; ++i)
-        unassert(!g_server->spawn());
+        npassert(!g_server->spawn());
+
+    // install security
+    if (!FLAG_unsecure) {
+        if (pledge(0, 0)) {
+            SLOG("warning: this OS doesn't support pledge() security");
+        } else if (pledge("stdio anet", 0)) {
+            perror("pledge");
+            exit(1);
+        }
+    }
 
     // run server
-    setup_signals();
+    signals_init();
+    llama_backend_init();
     g_server->run();
-    restore_signals();
+    llama_backend_free();
+    signals_destroy();
 
     // shutdown server
-    LOG("shutdown");
+    SLOG("shutdown");
     g_server->shutdown();
     g_server->close();
     delete g_server;
-    llama_free_model(g_model);
-    LOG("exit");
+    delete slots;
+    llama_free_model(model);
+    tokenbucket_destroy();
+    time_destroy();
+    SLOG("exit");
 
-    // // quality assurance
-    // CheckForMemoryLeaks();
+    // quality assurance
+    llamafile_task_shutdown();
+    while (!pthread_orphan_np())
+        pthread_decimate_np();
+    CheckForMemoryLeaks();
+    return 0;
+}
+
+} // namespace server
+} // namespace lf
+
+int
+main(int argc, char* argv[])
+{
+    return lf::server::main(argc, argv);
 }

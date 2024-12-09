@@ -18,11 +18,14 @@
 #pragma once
 #include <signal.h>
 
-void
-setup_signals(void);
+namespace lf {
+namespace server {
 
 void
-restore_signals(void);
+signals_init(void);
 
 void
-describe_crash(char*, size_t, int, siginfo_t*, void*);
+signals_destroy(void);
+
+} // namespace server
+} // namespace lf

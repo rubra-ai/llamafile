@@ -95,18 +95,15 @@ int embedding_cli(int argc, char ** argv) {
     LOG("%s: seed  = %u\n", __func__, params.seed);
 
     std::mt19937 rng(params.seed);
-    if (params.random_prompt) {
-        params.prompt = gpt_random_prompt(rng);
-    }
 
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    llama_model * model;
-    llama_context * ctx;
-
     // load the model
-    std::tie(model, ctx) = llama_init_from_gpt_params(params);
+    llama_init_result llama_init = llama_init_from_gpt_params(params);
+
+    llama_model * model = llama_init.model;
+    llama_context * ctx = llama_init.context;
     if (model == NULL) {
         fprintf(stderr, "%s: error: unable to load model\n", __func__);
         return 1;
@@ -118,12 +115,6 @@ int embedding_cli(int argc, char ** argv) {
     if (n_ctx > n_ctx_train) {
         LOG("%s: warning: model was trained on only %d context tokens (%d specified)\n",
                 __func__, n_ctx_train, n_ctx);
-    }
-
-    // print system information
-    {
-        LOG("\n");
-        LOG("%s\n", get_system_info(params).c_str());
     }
 
     // split the prompt into lines

@@ -18,11 +18,20 @@
 #pragma once
 #include <time.h>
 
+namespace lf {
+namespace server {
+
 void
 time_init();
+
+void
+time_destroy();
 
 void
 gmtime_lockless(long, tm*);
 
 void
 localtime_lockless(long, tm*);
+
+} // namespace server
+} // namespace lf

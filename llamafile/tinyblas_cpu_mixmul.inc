@@ -224,17 +224,10 @@ class MixMul {
                 return false;
             }
 #elif defined(__ARM_FEATURE_FP16_VECTOR_ARITHMETIC) && !defined(_MSC_VER)
-            if (result->op_params[0] == GGML_PREC_F32) {
-                return mixmat<
-                    4, 1,
-                    tinyBLAS<NCB | NCC, 4, float32x4_t, float32x4_t, ggml_fp16_t, ggml_fp16_t, TC>,
-                    ggml_fp16_t, ggml_fp16_t, TC>();
-            } else {
-                return mixmat<
-                    8, 1,
-                    tinyBLAS<NCB | NCC, 8, float16x8_t, float16x8_t, ggml_fp16_t, ggml_fp16_t, TC>,
-                    ggml_fp16_t, ggml_fp16_t, TC>();
-            }
+            return mixmat<
+                8, 1,
+                tinyBLAS<NCB | NCC, 8, float16x8_t, float16x8_t, ggml_fp16_t, ggml_fp16_t, TC>,
+                ggml_fp16_t, ggml_fp16_t, TC>();
 #elif defined(__ARM_NEON) && !defined(_MSC_VER)
             return mixmat<
                 4, 1,
@@ -279,31 +272,26 @@ class MixMul {
     bool mixmat() {
         if (cols % KN)
             return false;
-        switch (params->type) {
-        case GGML_TASK_TYPE_INIT:
-            if (thought->type != ggml_type_trait<TB>::id)
-                quantize_thought(ggml_type_trait<TB>::id);
-            build_row_pointers(ggml_type_trait<TB>::id);
-            return true;
-        case GGML_TASK_TYPE_COMPUTE:
-            assert(!(cols % BS));
-            assert(!(weights->nb[1] % sizeof(TA)));
-            for (int expert = 0; expert < experts; ++expert) {
-                BLAS tb{cols / BS,
-                        (const TA *)((const char *)weights->data + expert * weights->nb[2]),
-                        (long)(weights->nb[1] / sizeof(TA)),
-                        (const TB *)(rowptr_thought_ + expert * tokens * thinkers),
-                        0,
-                        (TC *)(rowptr_result_ + expert * tokens * thinkers),
-                        0,
-                        params->ith,
-                        params->nth};
-                tb.matmul(rows, rowptr_count_[expert], GGML_TASK_TYPE_COMPUTE);
-            }
-            return true;
-        default:
-            return true;
+        if (thought->type != ggml_type_trait<TB>::id)
+            quantize_thought(ggml_type_trait<TB>::id);
+        build_row_pointers(ggml_type_trait<TB>::id);
+        ggml_barrier(params);
+        assert(!(cols % BS));
+        assert(!(weights->nb[1] % sizeof(TA)));
+        // TODO(jart): parallelize this loop
+        for (int expert = 0; expert < experts; ++expert) {
+            BLAS tb{cols / BS,
+                    (const TA *)((const char *)weights->data + expert * weights->nb[2]),
+                    (long)(weights->nb[1] / sizeof(TA)),
+                    (const TB *)(rowptr_thought_ + expert * tokens * thinkers),
+                    0,
+                    (TC *)(rowptr_result_ + expert * tokens * thinkers),
+                    0,
+                    params->ith,
+                    params->nth};
+            tb.matmul(rows, rowptr_count_[expert]);
         }
+        return true;
     }
 
     void build_row_pointers(ggml_type vec_dot_type) {
